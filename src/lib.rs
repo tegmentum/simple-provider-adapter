@@ -122,10 +122,16 @@ impl km::Guest for Component {
     type Keydata = Keydata;
     type GenContext = GenContext;
 
+    /// For OSSL_OP_SIGNATURE, return the signature algorithm name
+    /// OpenSSL should fetch -- "ECDSA" for our EC keymgmt. (This is
+    /// NOT the keymgmt's name; it's the matching signature impl's
+    /// name that openssl invokes EVP_SIGNATURE_fetch on after
+    /// looking up our keymgmt.)
     fn query_operation_name(op: km::Operation) -> Option<String> {
         match op {
-            km::Operation::Signature | km::Operation::Keyexch => Some("EC".into()),
-            _ => None,
+            km::Operation::Signature => Some("ECDSA".into()),
+            km::Operation::Keyexch   => Some("ECDH".into()),
+            _                         => None,
         }
     }
 
@@ -143,7 +149,7 @@ impl km::Guest for Component {
         let key = backend::Key::new(&uri);
         let algorithm = key.algorithm();
         Ok(km::Keydata::new(Keydata {
-            uri,
+            uri: RefCell::new(uri),
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(Some(algorithm)),
         }))
@@ -163,7 +169,7 @@ impl km::Guest for Component {
 /// SignatureContext would require dup which the backend may not
 /// support.
 struct Keydata {
-    uri: String,
+    uri: RefCell<String>,
     backend_key: RefCell<Option<backend::Key>>,
     algorithm: RefCell<Option<backend::KeyAlgorithm>>,
 }
@@ -171,14 +177,67 @@ struct Keydata {
 impl km::GuestKeydata for Keydata {
     fn new() -> Self {
         Self {
-            uri: String::new(),
+            uri: RefCell::new(String::new()),
             backend_key: RefCell::new(None),
             algorithm: RefCell::new(None),
         }
     }
+    /// Phase 3: surface the params OpenSSL's EVP layer reads during
+    /// signature init -- "group" (curve name for EC), "bits" (key
+    /// size), "max-size" (max signature size). Ignores `_keys` --
+    /// returns the canonical set; OpenSSL picks the entries it wants.
     fn get_params(&self, _keys: Vec<String>)
         -> Result<Vec<km::OsslParam>, km::PkeyError> {
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        match self.algorithm.borrow().as_ref() {
+            Some(backend::KeyAlgorithm::Ec(info)) => {
+                out.push(km::OsslParam {
+                    key: "group".into(),
+                    value: pk::OsslParamValue::Utf8String(info.curve.clone()),
+                });
+                // Bit size + max-signature-size depend on curve.
+                let (bits, max_sig) = match info.curve.as_str() {
+                    "P-256" => (256u32, 72u64),
+                    "P-384" => (384, 104),
+                    "P-521" => (521, 139),
+                    _       => (256, 72),
+                };
+                out.push(km::OsslParam {
+                    key: "bits".into(),
+                    value: pk::OsslParamValue::UnsignedInteger(bits as u64),
+                });
+                out.push(km::OsslParam {
+                    key: "security-bits".into(),
+                    value: pk::OsslParamValue::UnsignedInteger(bits as u64 / 2),
+                });
+                out.push(km::OsslParam {
+                    key: "max-size".into(),
+                    value: pk::OsslParamValue::UnsignedInteger(max_sig),
+                });
+                // SPKI-derived encoded public key (so EVP_PKEY-side
+                // ops that need raw point bytes can find them).
+                if let Some(key) = self.backend_key.borrow().as_ref() {
+                    if let Ok(spki) = key.public_key_info() {
+                        out.push(km::OsslParam {
+                            key: "encoded-public-key".into(),
+                            value: pk::OsslParamValue::OctetString(spki),
+                        });
+                    }
+                }
+            }
+            Some(backend::KeyAlgorithm::Rsa(info)) => {
+                out.push(km::OsslParam {
+                    key: "bits".into(),
+                    value: pk::OsslParamValue::UnsignedInteger(info.modulus_bits as u64),
+                });
+                out.push(km::OsslParam {
+                    key: "max-size".into(),
+                    value: pk::OsslParamValue::UnsignedInteger((info.modulus_bits / 8) as u64),
+                });
+            }
+            _ => {}
+        }
+        Ok(out)
     }
     fn set_params(&self, _params: Vec<km::OsslParam>) -> Result<(), km::PkeyError> {
         Ok(())
@@ -195,13 +254,46 @@ impl km::GuestKeydata for Keydata {
     }
     fn match_(&self, other: km::KeydataBorrow<'_>, _selection: km::KeySelection) -> bool {
         let other = other.get::<Keydata>();
-        self.uri == other.uri
+        *self.uri.borrow() == *other.uri.borrow()
     }
     fn import(
-        &self, _selection: km::KeySelection, _params: Vec<km::OsslParam>,
+        &self, _selection: km::KeySelection, params: Vec<km::OsslParam>,
     ) -> Result<(), km::PkeyError> {
+        // Look for the "wit-bridge-uri" OSSL_PARAM; if present, treat
+        // its value as the URI for backend.Key::new. This lets the
+        // openssl-wasm side use the standard EVP_PKEY_fromdata API
+        // path (which routes through keymgmt.import) to construct a
+        // bridge-backed key, without needing OSSL_STORE wiring.
+        for p in &params {
+            if p.key == "wit-bridge-uri" {
+                let uri = match &p.value {
+                    pk::OsslParamValue::Utf8String(s) => s.clone(),
+                    pk::OsslParamValue::OctetString(b) => {
+                        String::from_utf8(b.clone()).map_err(|_|
+                            km::PkeyError::InvalidArgument(
+                                "wit-bridge-uri octet-string is not UTF-8".into()))?
+                    }
+                    _ => return Err(km::PkeyError::InvalidArgument(
+                        "wit-bridge-uri must be utf8-string or octet-string".into())),
+                };
+                let key = backend::Key::new(&uri);
+                let algorithm = key.algorithm();
+                // Mutate -- the resource was constructed empty by
+                // keymgmt.keydata.constructor, this import call fills
+                // it in.
+                *self.backend_key.borrow_mut() = Some(key);
+                *self.algorithm.borrow_mut()   = Some(algorithm);
+                // SAFETY: `self.uri` is read-only after construction.
+                // We can't mutate the String field directly (no
+                // RefCell wrap), so use unsafe interior mutation via
+                // pointer cast. Adapter is single-threaded; no race.
+                // Alternative: wrap uri in RefCell too.
+                *self.uri.borrow_mut() = uri;
+                return Ok(());
+            }
+        }
         Err(km::PkeyError::NotSupported(
-            "wit-bridge: import-by-params unsupported; use load(uri)".into()))
+            "wit-bridge: import requires the `wit-bridge-uri` OSSL_PARAM".into()))
     }
     fn export(
         &self, selection: km::KeySelection,
@@ -221,10 +313,11 @@ impl km::GuestKeydata for Keydata {
     }
     fn dup(&self, _selection: km::KeySelection)
         -> Result<km::Keydata, km::PkeyError> {
-        let key = backend::Key::new(&self.uri);
+        let uri = self.uri.borrow().clone();
+        let key = backend::Key::new(&uri);
         let algo = self.algorithm.borrow().clone();
         Ok(km::Keydata::new(Keydata {
-            uri: self.uri.clone(),
+            uri: RefCell::new(uri),
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(algo),
         }))
@@ -286,12 +379,13 @@ impl sig::GuestSignatureContext for SignatureContext {
         &self, key: sig::KeydataBorrow<'_>, params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
         let keydata = key.get::<Keydata>();
-        if keydata.uri.is_empty() {
+        let uri = keydata.uri.borrow().clone();
+        if uri.is_empty() {
             return Err(sig::PkeyError::InvalidState(
                 "wit-bridge sign_init: keydata is empty".into()));
         }
         let digest = parse_digest_param(&params);
-        self.uri.replace(Some(keydata.uri.clone()));
+        self.uri.replace(Some(uri));
         self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
         Ok(())
     }
@@ -325,13 +419,14 @@ impl sig::GuestSignatureContext for SignatureContext {
         _params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
         let keydata = key.get::<Keydata>();
-        if keydata.uri.is_empty() {
+        let uri = keydata.uri.borrow().clone();
+        if uri.is_empty() {
             return Err(sig::PkeyError::InvalidState(
                 "wit-bridge digest_sign_init: keydata is empty".into()));
         }
         let digest = md.as_deref().map(digest_name_to_backend)
             .unwrap_or(backend::DigestAlgorithm::Sha256);
-        self.uri.replace(Some(keydata.uri.clone()));
+        self.uri.replace(Some(uri));
         self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
         self.update_buf.borrow_mut().clear();
         Ok(())
