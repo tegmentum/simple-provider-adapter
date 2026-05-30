@@ -1,0 +1,31 @@
+package tegmentum:simple-provider-adapter@0.1.0;
+
+use openssl:pkey/pkey@0.1.0;
+use openssl:provider/provider@0.1.0;
+use openssl:keymgmt/keymgmt@0.1.0;
+use openssl:signature/signature@0.1.0;
+use openssl:asym-cipher/asym-cipher@0.1.0;
+use tegmentum:key-backend/key-backend@0.1.0;
+
+// Layer-2 adapter: exports the full openssl:provider-abi (so it can
+// be wac-plug'd into openssl-wasm in place of a no-op/native provider)
+// and imports the narrow tegmentum:key-backend (so a Layer-3 backend
+// can be wac-plug'd into it).
+//
+// One adapter instance corresponds to one OpenSSL provider instance.
+// The composed shape is:
+//
+//   openssl-wasm
+//     ↓ imports openssl:provider-abi (5 interfaces)
+//   simple-provider-adapter           ← this component
+//     ↓ imports tegmentum:key-backend
+//   <backend>                         ← pkcs11-bridge / stub / webauthn / ...
+world adapter {
+  export pkey;
+  export provider;
+  export keymgmt;
+  export signature;
+  export asym-cipher;
+
+  import key-backend;
+}

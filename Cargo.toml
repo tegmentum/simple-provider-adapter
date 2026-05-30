@@ -1,0 +1,20 @@
+[package]
+name    = "simple-provider-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen     = { version = "0.44", default-features = false, features = ["macros"] }
+wit-bindgen-rt  = { version = "0.44", features = ["bitflags"] }
+
+[profile.release]
+codegen-units = 1
+opt-level     = "s"
+debug         = false
+strip         = true
+lto           = true

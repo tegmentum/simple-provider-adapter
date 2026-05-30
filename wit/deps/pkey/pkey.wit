@@ -1,0 +1,191 @@
+// Shared types for the OpenSSL 3 provider ABI. Used by keymgmt,
+// signature, asym-cipher (and the Phase 8 backfills key-exchange,
+// kdf, mac, digest, cipher, kem).
+//
+// Mirrors the relevant subset of <openssl/core.h> and
+// <openssl/core_dispatch.h> against the pinned OpenSSL 3.6.2
+// (core_dispatch.h SHA c475666c52be37e02f0236cbe80ae3faaf54ed8b).
+
+package openssl:pkey@0.1.0;
+
+interface pkey {
+  // -------------------------------------------------------------------
+  // OSSL_PARAM modeling
+  // -------------------------------------------------------------------
+  //
+  // C `OSSL_PARAM` is an array of {key, type, data, data_size,
+  // return_size} records terminated by OSSL_PARAM_END. The C `type`
+  // enum (OSSL_PARAM_INTEGER, OSSL_PARAM_UNSIGNED_INTEGER,
+  // OSSL_PARAM_REAL, OSSL_PARAM_UTF8_STRING, OSSL_PARAM_OCTET_STRING,
+  // OSSL_PARAM_UTF8_PTR, OSSL_PARAM_OCTET_PTR) maps to a tagged
+  // variant on the WIT side. OSSL_PARAM_END is implicit -- WIT lists
+  // are length-prefixed, so no sentinel needed.
+  //
+  // Integers cover up to 64 bits; bigger numbers (RSA n/e/d/p/q/etc.)
+  // travel as `big-int` -- a big-endian byte buffer. Same wire shape
+  // as OpenSSL's BN serialization via OSSL_PARAM_INTEGER with
+  // arbitrarily-large data_size, but explicit so the adapter doesn't
+  // have to guess.
+  //
+  // Phase 1a ships the 9 variants TLS actually uses. Phase 8 widens
+  // as new param types surface (currently UTF8_PTR / OCTET_PTR aren't
+  // strictly needed -- they are hash-by-value semantics that the WIT
+  // string / list<u8> types already give for free).
+  variant ossl-param-value {
+    integer(s64),
+    unsigned-integer(u64),
+    real(f64),
+    utf8-string(string),
+    octet-string(list<u8>),
+    big-int(list<u8>),         // arbitrary-width integer, big-endian
+    boolean(bool),             // OSSL_PARAM_INTEGER with data_size=1
+    size(u64),                 // OSSL_PARAM_UNSIGNED_INTEGER, size_t semantics
+    unknown(list<u8>),         // fallback for unknown OSSL_PARAM_* types
+  }
+
+  record ossl-param {
+    key: string,
+    value: ossl-param-value,
+  }
+
+  // Descriptor returned from *_settable_params / *_gettable_params --
+  // tells callers which keys are accepted and what type each carries.
+  // The C API returns a sentinel OSSL_PARAM array with NULL `data`;
+  // we model it explicitly as (key, type-tag).
+  record ossl-param-descriptor {
+    key: string,
+    kind: ossl-param-kind,
+  }
+
+  enum ossl-param-kind {
+    integer,
+    unsigned-integer,
+    real,
+    utf8-string,
+    octet-string,
+    big-int,
+    boolean,
+    size,
+    unknown,
+  }
+
+  // -------------------------------------------------------------------
+  // Key selection bitfield
+  // -------------------------------------------------------------------
+  //
+  // From core_dispatch.h:
+  //   OSSL_KEYMGMT_SELECT_PRIVATE_KEY       0x01
+  //   OSSL_KEYMGMT_SELECT_PUBLIC_KEY        0x02
+  //   OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS 0x04
+  //   OSSL_KEYMGMT_SELECT_OTHER_PARAMETERS  0x80
+  //
+  // SELECT_KEYPAIR  = PRIVATE_KEY | PUBLIC_KEY
+  // SELECT_ALL_PARAMETERS = DOMAIN | OTHER
+  // SELECT_ALL = KEYPAIR | ALL_PARAMETERS
+  //
+  // WIT `flags` packs the bits; callers use set ops to combine.
+  flags key-selection {
+    private-key,
+    public-key,
+    domain-parameters,
+    other-parameters,
+  }
+
+  // Check-type for keymgmt_validate. Mirrors openssl's
+  // OSSL_KEYMGMT_VALIDATE_FULL_CHECK / *_QUICK_CHECK / *_FOR_DERIVE.
+  enum validation-level {
+    full-check,
+    quick-check,
+    for-derive,
+  }
+
+  // -------------------------------------------------------------------
+  // Errors
+  // -------------------------------------------------------------------
+  //
+  // All keymgmt / signature / asym-cipher methods that return `int`
+  // 0=failure / 1=success in the C ABI return `result<_, pkey-error>`
+  // in WIT. The variant differentiates the broad failure classes a
+  // provider needs to surface. Detail strings are optional but
+  // strongly encouraged for debugging.
+  variant pkey-error {
+    not-supported(string),     // operation not implemented (CKR_FUNCTION_NOT_SUPPORTED analog)
+    invalid-argument(string),  // bad params, wrong type, etc.
+    invalid-state(string),     // called in wrong lifecycle order
+    invalid-key(string),       // key data malformed
+    invalid-signature(string), // verify-only: signature doesn't match
+    insufficient-buffer(u64),  // sigsize/routsize too small; u64 = required size
+    backend-error(string),     // bubbled up from Layer-3 backend
+    internal(string),          // anything else; treat as a bug
+  }
+
+  // -------------------------------------------------------------------
+  // Operation classes
+  // -------------------------------------------------------------------
+  //
+  // From core_dispatch.h's OSSL_OP_* table:
+  //   DIGEST=1 CIPHER=2 MAC=3 KDF=4 RAND=5 KEYMGMT=10 KEYEXCH=11
+  //   SIGNATURE=12 ASYM_CIPHER=13 KEM=14 SKEYMGMT=15 ENCODER=20
+  //   DECODER=21 STORE=22
+  //
+  // Used by keymgmt.query-operation-name and provider.query-operation
+  // /.unquery-operation. The C ABI uses raw `int`; we type it as a
+  // closed enum and accept the migration cost of adding a variant when
+  // OpenSSL adds operations -- the alternative (raw s32) was rejected
+  // because every caller would need a parallel translation table.
+  // OSSL_OP_SKEYMGMT (3.4+) is included even though we don't expose
+  // an skeymgmt interface yet -- it's part of the ABI.
+  enum operation {
+    digest,
+    cipher,
+    mac,
+    kdf,
+    rand,
+    keymgmt,
+    keyexch,
+    signature,
+    asym-cipher,
+    kem,
+    skeymgmt,
+    encoder,
+    decoder,
+    store,
+  }
+
+  // -------------------------------------------------------------------
+  // Resources
+  // -------------------------------------------------------------------
+  //
+  // OpenSSL's `void *` opaques become typed WIT resources. The cap
+  // (openssl-wasm) gets handles back from the provider; lifetimes
+  // are explicit via the `free` semantics of each resource (the
+  // resource-drop is the canonical destructor; the keymgmt_free /
+  // signature_freectx / etc. funcs are NOT separately exported --
+  // they collapse into the resource drop).
+  //
+  // The C `void *provctx` does NOT get a WIT resource. WIT's
+  // component model already gives each provider its own instance, so
+  // the provider's internal state is implicit -- every method on
+  // every interface a provider exports runs in that provider's
+  // context automatically. (If a future use case needs multiple
+  // provctx handles per component we add a resource then.)
+
+  // Key material handle. Returned by keymgmt.new, .gen, .load,
+  // .dup, .import; consumed by signature.sign-init / verify-init,
+  // asym-cipher.encrypt-init / decrypt-init, etc.
+  resource keydata;
+
+  // Per-key-generation context. Created by keymgmt.gen-init, fed
+  // params / templates, consumed by keymgmt.gen.
+  resource gen-context;
+
+  // Per-sign-or-verify-operation context. Created by
+  // signature.signature-context.constructor, consumed by sign /
+  // verify.
+  resource signature-context;
+
+  // Per-encrypt-or-decrypt-operation context for RSA / similar.
+  // Created by asym-cipher.asym-cipher-context.constructor, consumed
+  // by encrypt / decrypt.
+  resource asym-cipher-context;
+}

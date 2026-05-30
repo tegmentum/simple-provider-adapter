@@ -1,0 +1,194 @@
+// OpenSSL 3 OSSL_OP_KEYMGMT mirror. Function IDs map 1:1 with the
+// OSSL_FUNC_KEYMGMT_* enum from <openssl/core_dispatch.h>:
+//
+//   NEW                       1   ->  keydata.new
+//   GEN_INIT                  2   ->  gen-init
+//   GEN_SET_TEMPLATE          3   ->  gen-context.set-template
+//   GEN_SET_PARAMS            4   ->  gen-context.set-params
+//   GEN_SETTABLE_PARAMS       5   ->  gen-context.settable-params
+//   GEN                       6   ->  gen-context.gen
+//   GEN_CLEANUP               7   ->  gen-context resource-drop (implicit)
+//   LOAD                      8   ->  load
+//   FREE                     10   ->  keydata resource-drop (implicit)
+//   GET_PARAMS               11   ->  keydata.get-params
+//   GETTABLE_PARAMS          12   ->  gettable-params
+//   SET_PARAMS               13   ->  keydata.set-params
+//   SETTABLE_PARAMS          14   ->  settable-params
+//   GEN_GET_PARAMS           15   ->  gen-context.get-params
+//   GEN_GETTABLE_PARAMS      16   ->  gen-context.gettable-params
+//   QUERY_OPERATION_NAME     20   ->  query-operation-name
+//   HAS                      21   ->  keydata.has
+//   VALIDATE                 22   ->  keydata.validate
+//   MATCH                    23   ->  keydata.match
+//   IMPORT                   40   ->  keydata.import
+//   IMPORT_TYPES             41   ->  import-types
+//   EXPORT                   42   ->  keydata.export
+//   EXPORT_TYPES             43   ->  export-types
+//   DUP                      44   ->  keydata.dup
+//   IMPORT_TYPES_EX          45   ->  import-types-ex
+//   EXPORT_TYPES_EX          46   ->  export-types-ex
+//
+// Two intentional model shifts from the C ABI:
+//
+// 1. `keymgmt_free`, `keymgmt_gen_cleanup` are not exposed as
+//    separate funcs -- they collapse into the resource-drop of
+//    `keydata` and `gen-context` respectively. WIT resource
+//    destructors are guaranteed to run.
+//
+// 2. `keymgmt_export` uses an OSSL_CALLBACK in C (the provider
+//    invokes the cb with the exported params). In WIT it returns
+//    `list<list<ossl-param>>` directly -- one inner list per
+//    "callback invocation". The simple-provider-adapter (Layer 2)
+//    wires the actual `OSSL_CALLBACK *` and walks the outer list.
+//
+// The OPERATION_ID in `query_operation_name` is OpenSSL's operation
+// enum (OSSL_OP_SIGNATURE, OSSL_OP_KEYEXCH, ...). We use the typed
+// `operation` enum from pkey rather than a raw s32 -- the
+// translation table lives in pkey and only needs touching when
+// OpenSSL adds an operation class.
+
+package openssl:keymgmt@0.1.0;
+
+interface keymgmt {
+  use openssl:pkey/pkey@0.1.0.{
+    keydata, gen-context, operation,
+    ossl-param, ossl-param-descriptor,
+    key-selection, validation-level, pkey-error,
+  };
+
+  // -------------------------------------------------------------------
+  // Algorithm-name discovery (OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME = 20)
+  //
+  // Returns the keymgmt algorithm name (e.g. "RSA", "EC") this
+  // keymgmt should be advertised under, given the operation kind.
+  query-operation-name: func(op: operation) -> option<string>;
+
+  // -------------------------------------------------------------------
+  // Static-key params (OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS  = 12,
+  //                  OSSL_FUNC_KEYMGMT_SETTABLE_PARAMS  = 14)
+  //
+  // Describe params that get-params / set-params on a keydata accept.
+  // C signature takes provctx and returns const OSSL_PARAM *. In WIT
+  // we omit provctx -- it's an implicit method of the provider
+  // resource (see openssl:provider/provider).
+  gettable-params: func() -> list<ossl-param-descriptor>;
+  settable-params: func() -> list<ossl-param-descriptor>;
+
+  // -------------------------------------------------------------------
+  // Type-descriptor params for import/export
+  // (OSSL_FUNC_KEYMGMT_IMPORT_TYPES         = 41,
+  //  OSSL_FUNC_KEYMGMT_EXPORT_TYPES         = 43,
+  //  OSSL_FUNC_KEYMGMT_IMPORT_TYPES_EX      = 45,
+  //  OSSL_FUNC_KEYMGMT_EXPORT_TYPES_EX      = 46)
+  //
+  // The non-ex variants don't take provctx; the ex variants do. We
+  // expose both forms because OpenSSL still calls the legacy form
+  // for backward compatibility.
+  import-types: func(selection: key-selection) -> list<ossl-param-descriptor>;
+  export-types: func(selection: key-selection) -> list<ossl-param-descriptor>;
+  import-types-ex: func(selection: key-selection) -> list<ossl-param-descriptor>;
+  export-types-ex: func(selection: key-selection) -> list<ossl-param-descriptor>;
+
+  // -------------------------------------------------------------------
+  // Key loading by STORE reference (OSSL_FUNC_KEYMGMT_LOAD = 8)
+  //
+  // `reference` is whatever the STORE provider handed us (typically a
+  // serialized URI or an internal opaque). The keymgmt knows how to
+  // dereference it back to a key. Phase 1a only models the byte form
+  // -- the STORE wiring proper lands in Phase 8.
+  load: func(reference: list<u8>) -> result<keydata, pkey-error>;
+
+  // -------------------------------------------------------------------
+  // Key generation lifecycle
+  // (OSSL_FUNC_KEYMGMT_GEN_INIT             = 2,
+  //  OSSL_FUNC_KEYMGMT_GEN_SETTABLE_PARAMS  = 5,
+  //  OSSL_FUNC_KEYMGMT_GEN_GETTABLE_PARAMS  = 16)
+  //
+  // gen-init returns a fresh gen-context with the given selection
+  // pre-set; further params can be poked via the gen-context methods.
+  gen-init: func(
+    selection: key-selection,
+    params: list<ossl-param>,
+  ) -> result<gen-context, pkey-error>;
+
+  // The settable / gettable params for the gen-context shape are
+  // properties of the keymgmt algorithm, not the per-call context, so
+  // we expose them as keymgmt-level funcs.
+  gen-settable-params: func() -> list<ossl-param-descriptor>;
+  gen-gettable-params: func() -> list<ossl-param-descriptor>;
+
+  // -------------------------------------------------------------------
+  // Keydata resource (NEW = 1, FREE = 10 + all instance methods)
+  //
+  // `new` allocates an empty keydata that subsequent .import calls
+  // fill in. The `free` C func is the resource destructor.
+  resource keydata-methods {
+    constructor();
+
+    // OSSL_FUNC_KEYMGMT_GET_PARAMS (11) / SET_PARAMS (13)
+    get-params: func(keys: list<string>) -> result<list<ossl-param>, pkey-error>;
+    set-params: func(params: list<ossl-param>) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_HAS (21):
+    // does the keydata contain everything `selection` asks for?
+    has: func(selection: key-selection) -> bool;
+
+    // OSSL_FUNC_KEYMGMT_VALIDATE (22)
+    validate: func(
+      selection: key-selection,
+      level: validation-level,
+    ) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_MATCH (23): are two keydatas equal for the
+    // selected components? Self is keydata-1; other is keydata-2.
+    %match: func(other: borrow<keydata>, selection: key-selection) -> bool;
+
+    // OSSL_FUNC_KEYMGMT_IMPORT (40): poke material into an existing
+    // keydata. Typically called right after `new`. `%import` because
+    // `import` is a WIT keyword.
+    %import: func(
+      selection: key-selection,
+      params: list<ossl-param>,
+    ) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_EXPORT (42): pull material out as one or
+    // more OSSL_PARAM bundles. Each inner list is one OSSL_CALLBACK
+    // invocation in the C ABI. For PKCS#11-backed keys the private
+    // selection should fail (no extraction); the adapter surfaces
+    // that as pkey-error::not-supported. `%export` because `export`
+    // is a WIT keyword.
+    %export: func(
+      selection: key-selection,
+    ) -> result<list<list<ossl-param>>, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_DUP (44): shallow copy of the selected
+    // components. Returns a fresh keydata.
+    dup: func(selection: key-selection) -> result<keydata, pkey-error>;
+  }
+
+  // -------------------------------------------------------------------
+  // Gen-context resource (GEN_INIT, GEN_SET_TEMPLATE, GEN_SET_PARAMS,
+  // GEN_GET_PARAMS, GEN, GEN_CLEANUP)
+  //
+  // The constructor is keymgmt.gen-init above; freeform-construction
+  // isn't part of the public API.
+  resource gen-context-methods {
+    // OSSL_FUNC_KEYMGMT_GEN_SET_TEMPLATE (3): seed the new key from
+    // an existing one (e.g., generate an EC key with the same curve
+    // as a template). Template is a borrow -- caller still owns it.
+    set-template: func(template: borrow<keydata>) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_GEN_SET_PARAMS (4): mutate gen params after
+    // gen-init. Common pattern: gen-init then loop setting params
+    // before calling .gen.
+    set-params: func(params: list<ossl-param>) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_GEN_GET_PARAMS (15)
+    get-params: func(keys: list<string>) -> result<list<ossl-param>, pkey-error>;
+
+    // OSSL_FUNC_KEYMGMT_GEN (6): run the generation. The C ABI takes
+    // an OSSL_CALLBACK for progress; Phase 1a omits it -- backends
+    // that care can surface progress through a future addition.
+    gen: func() -> result<keydata, pkey-error>;
+  }
+}

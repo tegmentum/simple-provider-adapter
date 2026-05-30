@@ -1,0 +1,175 @@
+// OpenSSL 3 provider entry-point mirror. The `OSSL_FUNC_PROVIDER_*`
+// family with IDs in [1024, 1032] (the "provider-implements" side).
+//
+//   PROVIDER_TEARDOWN          1024  ->  resource-drop (implicit; the
+//                                        component destructor IS the
+//                                        teardown -- there's no
+//                                        separate teardown func)
+//   PROVIDER_GETTABLE_PARAMS   1025  ->  gettable-params
+//   PROVIDER_GET_PARAMS        1026  ->  get-params
+//   PROVIDER_QUERY_OPERATION   1027  ->  query-operation
+//   PROVIDER_UNQUERY_OPERATION 1028  ->  unquery-operation
+//   PROVIDER_GET_REASON_STRINGS 1029 ->  get-reason-strings
+//   PROVIDER_GET_CAPABILITIES  1030  ->  get-capabilities
+//   PROVIDER_SELF_TEST         1031  ->  self-test
+//   PROVIDER_RANDOM_BYTES      1032  ->  random-bytes
+//
+// Excluded (these are "core-provided" funcs IDs 105-111+120+; they go
+// the OTHER direction -- core implements them, the provider imports
+// them. That reverse-direction wiring lives in openssl-wasm's Phase 2
+// patch, not in this interface):
+//   PROVIDER_REGISTER_CHILD_CB   105
+//   PROVIDER_DEREGISTER_CHILD_CB 106
+//   PROVIDER_NAME                107
+//   PROVIDER_GET0_PROVIDER_CTX   108
+//   PROVIDER_GET0_DISPATCH       109
+//   PROVIDER_UP_REF              110
+//   PROVIDER_FREE                111
+//   CORE_COUNT_TO_MARK           120
+//   ... etc.
+//
+// Model decisions:
+//
+// 1. Top-level funcs, no provider-context arg. WIT components are
+//    already instance-scoped; the provider's per-instance state is
+//    implicit. (See the provider-context note in openssl:pkey.)
+//
+// 2. provider_query_operation returns `const OSSL_ALGORITHM *` + an
+//    int *no_store out-param. In WIT we return `tuple<list<ossl-
+//    algorithm>, bool>` -- no out-params, and the algorithm array
+//    is owned by the caller after return (the C ABI's caller never
+//    frees the array, but the no-store bit decides whether OpenSSL
+//    caches the result; the WIT impl owns the lifetime through
+//    unquery-operation).
+//
+// 3. provider_get_capabilities takes an OSSL_CALLBACK; the provider
+//    invokes it once per capability set. We return `list<list<ossl-
+//    param>>` -- one inner list per "invocation". The Layer-2
+//    adapter walks the outer list and calls the real C callback.
+
+package openssl:provider@0.1.0;
+
+interface provider {
+  use openssl:pkey/pkey@0.1.0.{
+    operation, ossl-param, ossl-param-descriptor, pkey-error,
+  };
+
+  // -------------------------------------------------------------------
+  // Algorithm record (OSSL_ALGORITHM from <openssl/core.h>)
+  //
+  // C:
+  //   struct ossl_algorithm_st {
+  //     const char *algorithm_names;     /* key */
+  //     const char *property_definition; /* key */
+  //     const OSSL_DISPATCH *implementation;
+  //     const char *algorithm_description;
+  //   };
+  //
+  // The `implementation` field in C points to the dispatch table of
+  // function pointers for THIS algorithm. In WIT there's no such
+  // pointer because the dispatch is already in the keymgmt /
+  // signature / asym-cipher / ... interface the provider exports --
+  // the algorithm-name is the join key. The Layer-2 adapter builds
+  // the real OSSL_DISPATCH * at runtime when openssl-wasm asks for it.
+  record ossl-algorithm {
+    // Colon-separated algorithm aliases, e.g. "RSA:rsaEncryption:1.2.840.113549.1.1.1"
+    algorithm-names: string,
+    // OpenSSL property-query syntax, e.g. "provider=mine,fips=no"
+    property-definition: string,
+    // Optional human-readable description
+    description: option<string>,
+  }
+
+  // -------------------------------------------------------------------
+  // Reason-string record (OSSL_ITEM from <openssl/core.h>)
+  //
+  // C:
+  //   struct ossl_item_st { unsigned int id; void *ptr; };
+  //
+  // For get-reason-strings the `ptr` is `const char *` (the message).
+  // We make that concrete here -- OSSL_ITEM is used for other things
+  // elsewhere in the OpenSSL surface but this is the only place
+  // openssl-provider-wit needs it.
+  record ossl-reason-string {
+    id: u32,
+    message: string,
+  }
+
+  // -------------------------------------------------------------------
+  // RNG strength class (provider_random_bytes `which` arg)
+  //
+  // C:
+  //   OSSL_PROV_RANDOM_DRBG_PRIMARY = 0
+  //   OSSL_PROV_RANDOM_DRBG_PUBLIC  = 1
+  //   OSSL_PROV_RANDOM_DRBG_PRIVATE = 2
+  enum random-source {
+    drbg-primary,
+    drbg-public,
+    drbg-private,
+  }
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_GETTABLE_PARAMS (1025) /
+  // OSSL_FUNC_PROVIDER_GET_PARAMS (1026)
+  //
+  // Provider-level params (provider name, version, status, build
+  // info). Distinct from keymgmt-level params.
+  gettable-params: func() -> list<ossl-param-descriptor>;
+  get-params: func(keys: list<string>) -> result<list<ossl-param>, pkey-error>;
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_QUERY_OPERATION (1027)
+  //
+  // For a given operation class, return the algorithms this provider
+  // implements + a bit telling OpenSSL whether to cache the answer.
+  // Bool true == OSSL_NO_STORE_CACHE.
+  query-operation: func(op: operation) -> tuple<list<ossl-algorithm>, bool>;
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_UNQUERY_OPERATION (1028)
+  //
+  // Hand back the algorithm list query-operation returned. C uses
+  // this for the provider to free its array; in WIT the runtime
+  // owns the list after unwrap, so unquery is informational only --
+  // implementations may use it for refcounting or reference logging,
+  // but most can leave it empty.
+  unquery-operation: func(op: operation, algorithms: list<ossl-algorithm>);
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_GET_REASON_STRINGS (1029)
+  //
+  // Map error IDs the provider raises (via core_new_error/raise) to
+  // human-readable strings. Empty list = none provided.
+  get-reason-strings: func() -> list<ossl-reason-string>;
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_GET_CAPABILITIES (1030)
+  //
+  // Report capability metadata under a named class (e.g. "TLS-GROUP"
+  // for the TLS group registry). C invokes the OSSL_CALLBACK once per
+  // capability set; WIT returns the whole list in one shot --
+  // `list<list<ossl-param>>` is "outer = invocation, inner = the
+  // OSSL_PARAM[] passed to that invocation".
+  get-capabilities: func(capability: string)
+    -> result<list<list<ossl-param>>, pkey-error>;
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_SELF_TEST (1031)
+  //
+  // FIPS-style on-demand self test. Non-FIPS providers can implement
+  // as a trivial ok.
+  self-test: func() -> result<_, pkey-error>;
+
+  // -------------------------------------------------------------------
+  // OSSL_FUNC_PROVIDER_RANDOM_BYTES (1032)
+  //
+  // RNG byte source the provider exposes. `strength` is the requested
+  // security strength in bits (per NIST SP 800-90A). The C return is
+  // 1=ok / 0=fail; insufficient-strength surfaces as pkey-error::
+  // not-supported with detail.
+  random-bytes: func(
+    which: random-source,
+    n: u64,
+    strength: u32,
+  ) -> result<list<u8>, pkey-error>;
+}
