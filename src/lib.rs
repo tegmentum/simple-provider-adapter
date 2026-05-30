@@ -1,20 +1,23 @@
 //! simple-provider-adapter — Layer-2 of the openssl-provider-wit
 //! stack.
 //!
-//! Exports the full `openssl:provider-abi` (5 interfaces, ~120 funcs)
-//! and imports the narrow `tegmentum:key-backend`. Most adapter
-//! methods are mechanical translation between OpenSSL's `OSSL_PARAM`
-//! mechanism specs and the backend's typed `signature-mechanism` /
-//! `cipher-mechanism` variants.
+//! Exports the full `openssl:provider-abi` and imports the narrow
+//! `tegmentum:key-backend`. Most adapter methods are mechanical
+//! translation between OpenSSL's `OSSL_PARAM` mechanism specs and
+//! the backend's typed `signature-mechanism` / `cipher-mechanism`
+//! variants.
 //!
-//! Phase 3 scope: all interfaces stubbed so the component links;
-//! Phase 3.3 fills in the keymgmt+signature paths for one algorithm.
+//! Phase 3.3 scope: advertise one algorithm pair (keymgmt "EC" +
+//! signature "ECDSA"), wire keymgmt.load(uri) → backend.key(uri),
+//! wire signature.sign-init/sign → backend.sign.
 
 wit_bindgen::generate!({
     world: "adapter",
     path: "wit",
     generate_all,
 });
+
+use std::cell::RefCell;
 
 use exports::openssl::{
     asym_cipher::asym_cipher as ac,
@@ -23,24 +26,79 @@ use exports::openssl::{
     provider::provider as prov,
     signature::signature as sig,
 };
+use tegmentum::key_backend::key_backend as backend;
 
-// `Component` is the single target type for every Guest impl that
-// `export!` wires together. Resource-Guest impls live on per-resource
-// structs and are reached via the associated `type Foo = MyFoo;`
-// declarations on each interface's Guest impl.
 struct Component;
 
-// --- Provider ------------------------------------------------------------
+// =========================================================================
+// Helpers — OSSL_PARAM ↔ backend types
+// =========================================================================
+
+fn parse_digest_param(params: &[pk::OsslParam]) -> backend::DigestAlgorithm {
+    for p in params {
+        if p.key == "digest" {
+            if let pk::OsslParamValue::Utf8String(s) = &p.value {
+                return digest_name_to_backend(s);
+            }
+        }
+    }
+    backend::DigestAlgorithm::Sha256
+}
+
+fn digest_name_to_backend(s: &str) -> backend::DigestAlgorithm {
+    let up = s.to_ascii_uppercase();
+    let norm = up.replace('-', "").replace("SHA2", "SHA");
+    match norm.as_str() {
+        "SHA1"     => backend::DigestAlgorithm::Sha1,
+        "SHA224"   => backend::DigestAlgorithm::Sha224,
+        "SHA256"   => backend::DigestAlgorithm::Sha256,
+        "SHA384"   => backend::DigestAlgorithm::Sha384,
+        "SHA512"   => backend::DigestAlgorithm::Sha512,
+        "SHA3S256" => backend::DigestAlgorithm::Sha3S256,
+        "SHA3S384" => backend::DigestAlgorithm::Sha3S384,
+        "SHA3S512" => backend::DigestAlgorithm::Sha3S512,
+        _          => backend::DigestAlgorithm::Sha256,
+    }
+}
+
+fn backend_to_pkey(e: backend::BackendError) -> pk::PkeyError {
+    use backend::BackendError as B;
+    use pk::PkeyError as P;
+    match e {
+        B::KeyNotFound(s)           => P::InvalidKey(s),
+        B::AlgorithmMismatch(s)     => P::InvalidArgument(s),
+        B::MechanismNotSupported(s) => P::NotSupported(s),
+        B::AuthenticationFailed(s)  => P::InvalidState(s),
+        B::TransportError(s)        => P::BackendError(s),
+        B::Internal(s)              => P::BackendError(s),
+    }
+}
+
+// =========================================================================
+// PROVIDER
+// =========================================================================
 
 impl prov::Guest for Component {
     fn gettable_params() -> Vec<prov::OsslParamDescriptor> { Vec::new() }
     fn get_params(_keys: Vec<String>) -> Result<Vec<prov::OsslParam>, prov::PkeyError> {
         Ok(Vec::new())
     }
-    fn query_operation(_op: prov::Operation) -> (Vec<prov::OsslAlgorithm>, bool) {
-        // Phase 3.3 stub: advertise nothing yet. Will be populated
-        // when keymgmt/signature have working implementations.
-        (Vec::new(), true)
+    fn query_operation(op: prov::Operation) -> (Vec<prov::OsslAlgorithm>, bool) {
+        match op {
+            prov::Operation::Keymgmt => (
+                vec![prov::OsslAlgorithm {
+                    algorithm_names: "EC".into(),
+                    property_definition: "provider=wit-bridge".into(),
+                    description: Some("EC keymgmt via wit-bridge".into()),
+                }], false),
+            prov::Operation::Signature => (
+                vec![prov::OsslAlgorithm {
+                    algorithm_names: "ECDSA".into(),
+                    property_definition: "provider=wit-bridge".into(),
+                    description: Some("ECDSA via wit-bridge".into()),
+                }], false),
+            _ => (Vec::new(), true),
+        }
     }
     fn unquery_operation(_op: prov::Operation, _algorithms: Vec<prov::OsslAlgorithm>) {}
     fn get_reason_strings() -> Vec<prov::OsslReasonString> { Vec::new() }
@@ -52,18 +110,25 @@ impl prov::Guest for Component {
     fn random_bytes(
         _which: prov::RandomSource, _n: u64, _strength: u32,
     ) -> Result<Vec<u8>, prov::PkeyError> {
-        Err(prov::PkeyError::NotSupported(
-            "simple-provider-adapter: no RNG (use the default provider)".into()))
+        Err(prov::PkeyError::NotSupported("wit-bridge: no RNG".into()))
     }
 }
 
-// --- keymgmt -------------------------------------------------------------
+// =========================================================================
+// KEYMGMT
+// =========================================================================
 
 impl km::Guest for Component {
-    type KeydataMethods = KeydataMethods;
-    type GenContextMethods = GenContextMethods;
+    type Keydata = Keydata;
+    type GenContext = GenContext;
 
-    fn query_operation_name(_op: km::Operation) -> Option<String> { None }
+    fn query_operation_name(op: km::Operation) -> Option<String> {
+        match op {
+            km::Operation::Signature | km::Operation::Keyexch => Some("EC".into()),
+            _ => None,
+        }
+    }
+
     fn gettable_params() -> Vec<km::OsslParamDescriptor> { Vec::new() }
     fn settable_params() -> Vec<km::OsslParamDescriptor> { Vec::new() }
     fn import_types(_s: km::KeySelection) -> Vec<km::OsslParamDescriptor> { Vec::new() }
@@ -71,58 +136,104 @@ impl km::Guest for Component {
     fn import_types_ex(_s: km::KeySelection) -> Vec<km::OsslParamDescriptor> { Vec::new() }
     fn export_types_ex(_s: km::KeySelection) -> Vec<km::OsslParamDescriptor> { Vec::new() }
 
-    fn load(_reference: Vec<u8>) -> Result<km::Keydata, km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+    fn load(reference: Vec<u8>) -> Result<km::Keydata, km::PkeyError> {
+        let uri = String::from_utf8(reference)
+            .map_err(|_| km::PkeyError::InvalidArgument(
+                "wit-bridge load: reference is not UTF-8".into()))?;
+        let key = backend::Key::new(&uri);
+        let algorithm = key.algorithm();
+        Ok(km::Keydata::new(Keydata {
+            uri,
+            backend_key: RefCell::new(Some(key)),
+            algorithm: RefCell::new(Some(algorithm)),
+        }))
     }
     fn gen_init(
         _selection: km::KeySelection, _params: Vec<km::OsslParam>,
     ) -> Result<km::GenContext, km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(km::PkeyError::NotSupported("wit-bridge: keygen not supported".into()))
     }
     fn gen_settable_params() -> Vec<km::OsslParamDescriptor> { Vec::new() }
     fn gen_gettable_params() -> Vec<km::OsslParamDescriptor> { Vec::new() }
 }
 
-struct KeydataMethods;
+/// Per-keydata state. Phase 3 stores the URI plus the constructed
+/// backend Key. The URI doubles as the cheap identity key for the
+/// SignatureContext to clone -- holding the Key resource directly in
+/// SignatureContext would require dup which the backend may not
+/// support.
+struct Keydata {
+    uri: String,
+    backend_key: RefCell<Option<backend::Key>>,
+    algorithm: RefCell<Option<backend::KeyAlgorithm>>,
+}
 
-impl km::GuestKeydataMethods for KeydataMethods {
-    fn new() -> Self { Self }
+impl km::GuestKeydata for Keydata {
+    fn new() -> Self {
+        Self {
+            uri: String::new(),
+            backend_key: RefCell::new(None),
+            algorithm: RefCell::new(None),
+        }
+    }
     fn get_params(&self, _keys: Vec<String>)
         -> Result<Vec<km::OsslParam>, km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        Ok(Vec::new())
     }
     fn set_params(&self, _params: Vec<km::OsslParam>) -> Result<(), km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        Ok(())
     }
-    fn has(&self, _selection: km::KeySelection) -> bool { false }
+    fn has(&self, selection: km::KeySelection) -> bool {
+        if self.backend_key.borrow().is_none() { return false; }
+        let mask = km::KeySelection::PRIVATE_KEY | km::KeySelection::PUBLIC_KEY;
+        selection.intersects(mask)
+    }
     fn validate(
         &self, _selection: km::KeySelection, _level: km::ValidationLevel,
     ) -> Result<(), km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        Ok(())
     }
-    fn match_(&self, _other: km::KeydataBorrow<'_>, _selection: km::KeySelection) -> bool {
-        false
+    fn match_(&self, other: km::KeydataBorrow<'_>, _selection: km::KeySelection) -> bool {
+        let other = other.get::<Keydata>();
+        self.uri == other.uri
     }
     fn import(
         &self, _selection: km::KeySelection, _params: Vec<km::OsslParam>,
     ) -> Result<(), km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(km::PkeyError::NotSupported(
+            "wit-bridge: import-by-params unsupported; use load(uri)".into()))
     }
     fn export(
-        &self, _selection: km::KeySelection,
+        &self, selection: km::KeySelection,
     ) -> Result<Vec<Vec<km::OsslParam>>, km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        if selection.contains(km::KeySelection::PRIVATE_KEY) {
+            return Err(km::PkeyError::NotSupported(
+                "wit-bridge: private key cannot be extracted".into()));
+        }
+        let key = self.backend_key.borrow();
+        let key = key.as_ref().ok_or_else(||
+            km::PkeyError::InvalidState("keydata has no backend key".into()))?;
+        let spki = key.public_key_info().map_err(backend_to_pkey)?;
+        Ok(vec![vec![km::OsslParam {
+            key: "encoded-public-key".into(),
+            value: pk::OsslParamValue::OctetString(spki),
+        }]])
     }
     fn dup(&self, _selection: km::KeySelection)
         -> Result<km::Keydata, km::PkeyError> {
-        Err(km::PkeyError::NotSupported("phase-3 stub".into()))
+        let key = backend::Key::new(&self.uri);
+        let algo = self.algorithm.borrow().clone();
+        Ok(km::Keydata::new(Keydata {
+            uri: self.uri.clone(),
+            backend_key: RefCell::new(Some(key)),
+            algorithm: RefCell::new(algo),
+        }))
     }
 }
 
-struct GenContextMethods;
-
-impl km::GuestGenContextMethods for GenContextMethods {
-    fn set_template(&self, _tmpl: km::KeydataBorrow<'_>) -> Result<(), km::PkeyError> {
+struct GenContext;
+impl km::GuestGenContext for GenContext {
+    fn set_template(&self, _t: km::KeydataBorrow<'_>) -> Result<(), km::PkeyError> {
         Err(km::PkeyError::NotSupported("phase-3 stub".into()))
     }
     fn set_params(&self, _params: Vec<km::OsslParam>) -> Result<(), km::PkeyError> {
@@ -137,107 +248,145 @@ impl km::GuestGenContextMethods for GenContextMethods {
     }
 }
 
-// --- signature -----------------------------------------------------------
+// =========================================================================
+// SIGNATURE
+// =========================================================================
 
 impl sig::Guest for Component {
-    type SignatureContextMethods = SignatureContextMethods;
+    type SignatureContext = SignatureContext;
 
-    fn query_key_types() -> Vec<String> { Vec::new() }
+    fn query_key_types() -> Vec<String> { vec!["EC".into()] }
     fn gettable_ctx_params() -> Vec<sig::OsslParamDescriptor> { Vec::new() }
     fn settable_ctx_params() -> Vec<sig::OsslParamDescriptor> { Vec::new() }
 }
 
-struct SignatureContextMethods;
+/// Per-signature-op state.
+struct SignatureContext {
+    uri: RefCell<Option<String>>,
+    mech: RefCell<Option<backend::SignatureMechanism>>,
+    update_buf: RefCell<Vec<u8>>,
+}
 
-impl sig::GuestSignatureContextMethods for SignatureContextMethods {
-    fn new(_propq: Option<String>) -> Self { Self }
+impl sig::GuestSignatureContext for SignatureContext {
+    fn new(_propq: Option<String>) -> Self {
+        Self {
+            uri: RefCell::new(None),
+            mech: RefCell::new(None),
+            update_buf: RefCell::new(Vec::new()),
+        }
+    }
     fn dup(&self) -> Result<sig::SignatureContext, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Ok(sig::SignatureContext::new(Self {
+            uri: RefCell::new(self.uri.borrow().clone()),
+            mech: RefCell::new(self.mech.borrow().clone()),
+            update_buf: RefCell::new(self.update_buf.borrow().clone()),
+        }))
     }
     fn sign_init(
-        &self, _key: sig::KeydataBorrow<'_>, _params: Vec<sig::OsslParam>,
+        &self, key: sig::KeydataBorrow<'_>, params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        let keydata = key.get::<Keydata>();
+        if keydata.uri.is_empty() {
+            return Err(sig::PkeyError::InvalidState(
+                "wit-bridge sign_init: keydata is empty".into()));
+        }
+        let digest = parse_digest_param(&params);
+        self.uri.replace(Some(keydata.uri.clone()));
+        self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
+        Ok(())
     }
-    fn sign(&self, _tbs: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+    fn sign(&self, tbs: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
+        let uri = self.uri.borrow().clone().ok_or_else(||
+            sig::PkeyError::InvalidState("sign called before sign_init".into()))?;
+        let mech = self.mech.borrow().clone().ok_or_else(||
+            sig::PkeyError::InvalidState("sign called before sign_init".into()))?;
+        let key = backend::Key::new(&uri);
+        key.sign(&tbs, mech).map_err(backend_to_pkey)
     }
     fn verify_init(
         &self, _key: sig::KeydataBorrow<'_>, _params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported(
+            "wit-bridge: verify uses openssl's own public-key path".into()))
     }
     fn verify(&self, _sig: Vec<u8>, _tbs: Vec<u8>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: see verify_init".into()))
     }
     fn verify_recover_init(
         &self, _key: sig::KeydataBorrow<'_>, _params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: verify_recover is RSA-only".into()))
     }
     fn verify_recover(&self, _sig: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: verify_recover is RSA-only".into()))
     }
     fn digest_sign_init(
-        &self, _md: Option<String>, _key: sig::KeydataBorrow<'_>,
+        &self, md: Option<String>, key: sig::KeydataBorrow<'_>,
         _params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        let keydata = key.get::<Keydata>();
+        if keydata.uri.is_empty() {
+            return Err(sig::PkeyError::InvalidState(
+                "wit-bridge digest_sign_init: keydata is empty".into()));
+        }
+        let digest = md.as_deref().map(digest_name_to_backend)
+            .unwrap_or(backend::DigestAlgorithm::Sha256);
+        self.uri.replace(Some(keydata.uri.clone()));
+        self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
+        self.update_buf.borrow_mut().clear();
+        Ok(())
     }
-    fn digest_sign_update(&self, _data: Vec<u8>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+    fn digest_sign_update(&self, data: Vec<u8>) -> Result<(), sig::PkeyError> {
+        self.update_buf.borrow_mut().extend_from_slice(&data);
+        Ok(())
     }
     fn digest_sign_final(&self) -> Result<Vec<u8>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        let tbs = std::mem::take(&mut *self.update_buf.borrow_mut());
+        self.sign(tbs)
     }
-    fn digest_sign(&self, _tbs: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+    fn digest_sign(&self, tbs: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
+        self.sign(tbs)
     }
     fn digest_verify_init(
         &self, _md: Option<String>, _key: sig::KeydataBorrow<'_>,
         _params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: see verify_init".into()))
     }
     fn digest_verify_update(&self, _data: Vec<u8>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: see verify_init".into()))
     }
     fn digest_verify_final(&self, _sig: Vec<u8>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: see verify_init".into()))
     }
     fn digest_verify(&self, _sig: Vec<u8>, _tbs: Vec<u8>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
+        Err(sig::PkeyError::NotSupported("wit-bridge: see verify_init".into()))
     }
     fn get_ctx_params(&self, _keys: Vec<String>)
-        -> Result<Vec<sig::OsslParam>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
-    }
-    fn set_ctx_params(&self, _params: Vec<sig::OsslParam>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
-    }
+        -> Result<Vec<sig::OsslParam>, sig::PkeyError> { Ok(Vec::new()) }
+    fn set_ctx_params(&self, _params: Vec<sig::OsslParam>)
+        -> Result<(), sig::PkeyError> { Ok(()) }
     fn get_ctx_md_params(&self, _keys: Vec<String>)
-        -> Result<Vec<sig::OsslParam>, sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
-    }
-    fn set_ctx_md_params(&self, _params: Vec<sig::OsslParam>) -> Result<(), sig::PkeyError> {
-        Err(sig::PkeyError::NotSupported("phase-3 stub".into()))
-    }
+        -> Result<Vec<sig::OsslParam>, sig::PkeyError> { Ok(Vec::new()) }
+    fn set_ctx_md_params(&self, _params: Vec<sig::OsslParam>)
+        -> Result<(), sig::PkeyError> { Ok(()) }
     fn gettable_ctx_md_params(&self) -> Vec<sig::OsslParamDescriptor> { Vec::new() }
     fn settable_ctx_md_params(&self) -> Vec<sig::OsslParamDescriptor> { Vec::new() }
 }
 
-// --- asym-cipher ---------------------------------------------------------
+// =========================================================================
+// ASYM-CIPHER (Phase 8 will wire for RSA decrypt)
+// =========================================================================
 
 impl ac::Guest for Component {
-    type AsymCipherContextMethods = AsymCipherContextMethods;
+    type AsymCipherContext = AsymCipherContext;
 
     fn gettable_ctx_params() -> Vec<ac::OsslParamDescriptor> { Vec::new() }
     fn settable_ctx_params() -> Vec<ac::OsslParamDescriptor> { Vec::new() }
 }
 
-struct AsymCipherContextMethods;
-
-impl ac::GuestAsymCipherContextMethods for AsymCipherContextMethods {
+struct AsymCipherContext;
+impl ac::GuestAsymCipherContext for AsymCipherContext {
     fn new() -> Self { Self }
     fn dup(&self) -> Result<ac::AsymCipherContext, ac::PkeyError> {
         Err(ac::PkeyError::NotSupported("phase-3 stub".into()))
@@ -259,33 +408,15 @@ impl ac::GuestAsymCipherContextMethods for AsymCipherContextMethods {
         Err(ac::PkeyError::NotSupported("phase-3 stub".into()))
     }
     fn get_ctx_params(&self, _keys: Vec<String>)
-        -> Result<Vec<ac::OsslParam>, ac::PkeyError> {
-        Err(ac::PkeyError::NotSupported("phase-3 stub".into()))
-    }
-    fn set_ctx_params(&self, _params: Vec<ac::OsslParam>) -> Result<(), ac::PkeyError> {
-        Err(ac::PkeyError::NotSupported("phase-3 stub".into()))
-    }
+        -> Result<Vec<ac::OsslParam>, ac::PkeyError> { Ok(Vec::new()) }
+    fn set_ctx_params(&self, _params: Vec<ac::OsslParam>)
+        -> Result<(), ac::PkeyError> { Ok(()) }
 }
 
-// --- pkey (just resources; no top-level methods) -------------------------
-
-impl pk::Guest for Component {
-    type Keydata = Keydata;
-    type GenContext = GenContext;
-    type SignatureContext = SignatureContextResource;
-    type AsymCipherContext = AsymCipherContextResource;
-}
-
-struct Keydata;
-impl pk::GuestKeydata for Keydata {}
-
-struct GenContext;
-impl pk::GuestGenContext for GenContext {}
-
-struct SignatureContextResource;
-impl pk::GuestSignatureContext for SignatureContextResource {}
-
-struct AsymCipherContextResource;
-impl pk::GuestAsymCipherContext for AsymCipherContextResource {}
+// pkey holds only types now -- no Guest trait to implement.
+// Reference the type module so wit-bindgen still pulls it into the
+// canonical-ABI metadata.
+#[allow(dead_code)]
+type _PkeyOsslParam = pk::OsslParam;
 
 export!(Component);

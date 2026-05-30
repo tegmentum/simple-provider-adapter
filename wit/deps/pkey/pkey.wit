@@ -152,40 +152,16 @@ interface pkey {
     store,
   }
 
-  // -------------------------------------------------------------------
-  // Resources
-  // -------------------------------------------------------------------
-  //
-  // OpenSSL's `void *` opaques become typed WIT resources. The cap
-  // (openssl-wasm) gets handles back from the provider; lifetimes
-  // are explicit via the `free` semantics of each resource (the
-  // resource-drop is the canonical destructor; the keymgmt_free /
-  // signature_freectx / etc. funcs are NOT separately exported --
-  // they collapse into the resource drop).
+  // Note on resources: pkey holds only types. Resources (`keydata`,
+  // `gen-context`, `signature-context`, `asym-cipher-context`) live
+  // in the interface that owns their methods -- keymgmt for the
+  // first two, signature and asym-cipher respectively for the
+  // others. signature.wit and asym-cipher.wit `use` keymgmt.keydata
+  // for parameters that take a key handle.
   //
   // The C `void *provctx` does NOT get a WIT resource. WIT's
   // component model already gives each provider its own instance, so
   // the provider's internal state is implicit -- every method on
   // every interface a provider exports runs in that provider's
-  // context automatically. (If a future use case needs multiple
-  // provctx handles per component we add a resource then.)
-
-  // Key material handle. Returned by keymgmt.new, .gen, .load,
-  // .dup, .import; consumed by signature.sign-init / verify-init,
-  // asym-cipher.encrypt-init / decrypt-init, etc.
-  resource keydata;
-
-  // Per-key-generation context. Created by keymgmt.gen-init, fed
-  // params / templates, consumed by keymgmt.gen.
-  resource gen-context;
-
-  // Per-sign-or-verify-operation context. Created by
-  // signature.signature-context.constructor, consumed by sign /
-  // verify.
-  resource signature-context;
-
-  // Per-encrypt-or-decrypt-operation context for RSA / similar.
-  // Created by asym-cipher.asym-cipher-context.constructor, consumed
-  // by encrypt / decrypt.
-  resource asym-cipher-context;
+  // context automatically.
 }

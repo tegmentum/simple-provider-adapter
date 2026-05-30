@@ -1,5 +1,5 @@
-// OpenSSL 3 OSSL_OP_ASYM_CIPHER mirror. The 11 OSSL_FUNC_ASYM_CIPHER_*
-// IDs map 1:1:
+// OpenSSL 3 OSSL_OP_ASYM_CIPHER mirror. All 11 OSSL_FUNC_ASYM_CIPHER_*
+// mapped:
 //
 //   NEWCTX                1   ->  asym-cipher-context constructor
 //   ENCRYPT_INIT          2   ->  asym-cipher-context.encrypt-init
@@ -9,75 +9,51 @@
 //   FREECTX               6   ->  asym-cipher-context resource-drop (implicit)
 //   DUPCTX                7   ->  asym-cipher-context.dup
 //   GET_CTX_PARAMS        8   ->  asym-cipher-context.get-ctx-params
-//   GETTABLE_CTX_PARAMS   9   ->  gettable-ctx-params
+//   GETTABLE_CTX_PARAMS   9   ->  gettable-ctx-params (top-level)
 //   SET_CTX_PARAMS       10   ->  asym-cipher-context.set-ctx-params
-//   SETTABLE_CTX_PARAMS  11   ->  settable-ctx-params
+//   SETTABLE_CTX_PARAMS  11   ->  settable-ctx-params (top-level)
 //
-// Used for RSA encrypt/decrypt -- TLS 1.2 RSA key exchange (premaster
-// secret encryption) and PKCS#11 RSA decrypt operations.
-//
-// Same two model shifts as keymgmt and signature:
-//
-// 1. asym_cipher_freectx collapses into the resource-drop of
-//    asym-cipher-context (WIT destructor).
-//
-// 2. asym_cipher_encrypt / decrypt use C-style output buffers
-//    (caller allocates, callee writes, *outlen reports written
-//    length). WIT returns `result<list<u8>, pkey-error>` and
-//    surfaces too-small-output via `pkey-error::insufficient-buffer
-//    (u64)` carrying the required size.
+// Same model shifts as keymgmt and signature:
+//   - freectx collapses into resource-drop
+//   - encrypt/decrypt return list<u8>; insufficient-buffer surfaces
+//     via pkey-error::insufficient-buffer(u64)
+//   - The C `void *provkey` becomes borrow<keydata> from keymgmt
 
 package openssl:asym-cipher@0.1.0;
 
 interface asym-cipher {
-  use openssl:pkey/pkey@0.1.0.{
-    keydata, asym-cipher-context,
-    ossl-param, ossl-param-descriptor,
-    pkey-error,
-  };
+  use openssl:pkey/pkey@0.1.0.{ossl-param, ossl-param-descriptor, pkey-error};
+  use openssl:keymgmt/keymgmt@0.1.0.{keydata};
 
   // -------------------------------------------------------------------
-  // GETTABLE_CTX_PARAMS (9) / SETTABLE_CTX_PARAMS (11)
-  //
-  // Per-context params an asym-cipher accepts (e.g. "pad-mode",
-  // "oaep-digest", "oaep-label", "mgf1-digest" for RSA OAEP).
+  // Top-level: GETTABLE_CTX_PARAMS (9) / SETTABLE_CTX_PARAMS (11)
+  // -------------------------------------------------------------------
   gettable-ctx-params: func() -> list<ossl-param-descriptor>;
   settable-ctx-params: func() -> list<ossl-param-descriptor>;
 
   // -------------------------------------------------------------------
-  // asym-cipher-context resource (NEWCTX, FREECTX, DUPCTX + instance methods)
-  resource asym-cipher-context-methods {
-    // OSSL_FUNC_ASYM_CIPHER_NEWCTX (1):
-    // C `newctx(void *provctx)`. provctx is implicit (the WIT
-    // component owns the provider state). No propq arg here unlike
-    // signature -- asym_cipher's NEWCTX doesn't take one in 3.x.
+  // asym-cipher-context resource
+  // -------------------------------------------------------------------
+  resource asym-cipher-context {
+    // NEWCTX (1) -- C signature takes (void *provctx); provctx is
+    // implicit. No propq here unlike signature -- asym-cipher's
+    // NEWCTX doesn't take one in 3.x.
     constructor();
 
-    // OSSL_FUNC_ASYM_CIPHER_DUPCTX (7)
+    // DUPCTX (7)
     dup: func() -> result<asym-cipher-context, pkey-error>;
 
-    // ---------------------------------------------------------------
     // Encrypt path
-
-    // OSSL_FUNC_ASYM_CIPHER_ENCRYPT_INIT (2)
     encrypt-init: func(key: borrow<keydata>, params: list<ossl-param>)
       -> result<_, pkey-error>;
-    // OSSL_FUNC_ASYM_CIPHER_ENCRYPT (3)
     encrypt: func(plaintext: list<u8>) -> result<list<u8>, pkey-error>;
 
-    // ---------------------------------------------------------------
     // Decrypt path
-
-    // OSSL_FUNC_ASYM_CIPHER_DECRYPT_INIT (4)
     decrypt-init: func(key: borrow<keydata>, params: list<ossl-param>)
       -> result<_, pkey-error>;
-    // OSSL_FUNC_ASYM_CIPHER_DECRYPT (5)
     decrypt: func(ciphertext: list<u8>) -> result<list<u8>, pkey-error>;
 
-    // ---------------------------------------------------------------
     // Per-context params
-
-    // OSSL_FUNC_ASYM_CIPHER_GET_CTX_PARAMS (8) / SET_CTX_PARAMS (10)
     get-ctx-params: func(keys: list<string>)
       -> result<list<ossl-param>, pkey-error>;
     set-ctx-params: func(params: list<ossl-param>)

@@ -1,7 +1,7 @@
 // OpenSSL 3 OSSL_OP_SIGNATURE mirror. Function IDs map 1:1 with the
 // OSSL_FUNC_SIGNATURE_* enum from <openssl/core_dispatch.h>:
 //
-//   NEWCTX                       1   ->  signature-context constructor (via newctx)
+//   NEWCTX                       1   ->  signature-context constructor
 //   SIGN_INIT                    2   ->  signature-context.sign-init
 //   SIGN                         3   ->  signature-context.sign
 //   VERIFY_INIT                  4   ->  signature-context.verify-init
@@ -19,151 +19,102 @@
 //   FREECTX                     16   ->  signature-context resource-drop (implicit)
 //   DUPCTX                      17   ->  signature-context.dup
 //   GET_CTX_PARAMS              18   ->  signature-context.get-ctx-params
-//   GETTABLE_CTX_PARAMS         19   ->  gettable-ctx-params
+//   GETTABLE_CTX_PARAMS         19   ->  gettable-ctx-params (top-level)
 //   SET_CTX_PARAMS              20   ->  signature-context.set-ctx-params
-//   SETTABLE_CTX_PARAMS         21   ->  settable-ctx-params
+//   SETTABLE_CTX_PARAMS         21   ->  settable-ctx-params (top-level)
 //   GET_CTX_MD_PARAMS           22   ->  signature-context.get-ctx-md-params
 //   GETTABLE_CTX_MD_PARAMS      23   ->  signature-context.gettable-ctx-md-params
 //   SET_CTX_MD_PARAMS           24   ->  signature-context.set-ctx-md-params
 //   SETTABLE_CTX_MD_PARAMS      25   ->  signature-context.settable-ctx-md-params
-//   QUERY_KEY_TYPES             26   ->  query-key-types
+//   QUERY_KEY_TYPES             26   ->  query-key-types (top-level)
 //
 // One-shot sign/verify-message family (added in OpenSSL 3.2, IDs 27-32)
-// is deferred to Phase 8 -- the streaming digest-sign / digest-verify
-// covers the same surface for our TLS use case and the one-shot is
-// just a fast path.
+// deferred to Phase 8.
 //
-// Two intentional model shifts from the C ABI:
+// Model shifts from the C ABI:
 //
-// 1. `signature_newctx` becomes the `signature-context` constructor.
-//    Its C signature `(void *provctx, const char *propq)` translates
-//    to the constructor arg `propq`; provctx is the implicit `self`
-//    of the provider resource that owns this `signature` interface
-//    instance.
+// 1. `signature_newctx` becomes the `signature-context` constructor;
+//    its C `propq` arg is the constructor arg; provctx is implicit
+//    (the component instance).
 //
-// 2. `signature_sign` / `verify` and the digest_* family use C-style
-//    output buffers (caller allocates, callee writes + reports
-//    written-length). WIT uses `result<list<u8>, pkey-error>` and
-//    surfaces insufficient-buffer via the `pkey-error::insufficient-
-//    buffer(u64)` variant -- the u64 carries the required size so
-//    callers can probe before allocating.
+// 2. The C `void *provkey` for sign-init / verify-init is
+//    `borrow<keydata>` via `use openssl:keymgmt/keymgmt.{keydata}`.
+//
+// 3. sign / verify / digest_* use C output buffers; WIT returns
+//    `result<list<u8>, pkey-error>` with `insufficient-buffer(u64)`
+//    carrying the required size.
 
 package openssl:signature@0.1.0;
 
 interface signature {
-  use openssl:pkey/pkey@0.1.0.{
-    keydata, signature-context,
-    ossl-param, ossl-param-descriptor,
-    pkey-error,
-  };
+  use openssl:pkey/pkey@0.1.0.{ossl-param, ossl-param-descriptor, pkey-error};
+  use openssl:keymgmt/keymgmt@0.1.0.{keydata};
 
   // -------------------------------------------------------------------
-  // QUERY_KEY_TYPES (26): which keydata algorithm names does this
-  // signature work against? (e.g. ["RSA", "RSA-PSS"] for RSA-PSS.)
-  // C returns NULL-terminated array of strings.
+  // Top-level
+  // -------------------------------------------------------------------
+
+  // OSSL_FUNC_SIGNATURE_QUERY_KEY_TYPES (26):
   query-key-types: func() -> list<string>;
 
-  // -------------------------------------------------------------------
-  // GETTABLE_CTX_PARAMS / SETTABLE_CTX_PARAMS (19 / 21)
-  //
-  // Describe the per-operation params (e.g. "pad-mode", "digest",
-  // "saltlen") this signature accepts.
+  // OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS (19) /
+  // SETTABLE_CTX_PARAMS (21)
   gettable-ctx-params: func() -> list<ossl-param-descriptor>;
   settable-ctx-params: func() -> list<ossl-param-descriptor>;
 
   // -------------------------------------------------------------------
-  // signature-context resource (NEWCTX, FREECTX, DUPCTX + all inst methods)
-  resource signature-context-methods {
-    // OSSL_FUNC_SIGNATURE_NEWCTX (1):
-    // `propq` is the OpenSSL property query string ("provider=foo",
-    // "fips=yes", etc.). None == NULL in C.
+  // signature-context resource
+  // -------------------------------------------------------------------
+  resource signature-context {
+    // NEWCTX (1)
     constructor(propq: option<string>);
 
-    // OSSL_FUNC_SIGNATURE_DUPCTX (17): clone the context. Useful for
-    // streaming hash + later "what would the signature be" probes.
+    // DUPCTX (17)
     dup: func() -> result<signature-context, pkey-error>;
 
-    // ---------------------------------------------------------------
-    // One-shot sign (init + sign).
-    //
-    // OSSL_FUNC_SIGNATURE_SIGN_INIT (2):
+    // One-shot sign (init + sign)
     sign-init: func(key: borrow<keydata>, params: list<ossl-param>)
       -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_SIGN (3):
-    // `tbs` = to-be-signed bytes (already hashed if needed).
     sign: func(tbs: list<u8>) -> result<list<u8>, pkey-error>;
 
-    // OSSL_FUNC_SIGNATURE_VERIFY_INIT (4):
     verify-init: func(key: borrow<keydata>, params: list<ossl-param>)
       -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_VERIFY (5):
     verify: func(sig: list<u8>, tbs: list<u8>) -> result<_, pkey-error>;
 
-    // OSSL_FUNC_SIGNATURE_VERIFY_RECOVER_INIT (6):
     verify-recover-init: func(key: borrow<keydata>, params: list<ossl-param>)
       -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_VERIFY_RECOVER (7):
-    // RSA-style scheme that recovers the original plaintext from
-    // signature (deprecated for new code, still needed for legacy
-    // X.509 cert chains).
     verify-recover: func(sig: list<u8>) -> result<list<u8>, pkey-error>;
 
-    // ---------------------------------------------------------------
-    // Streaming digest-sign (init + update* + final) or one-shot
-    // digest-sign convenience.
-
-    // OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT (8):
-    // `mdname` is e.g. "SHA2-256". None means caller will hash
-    // separately (rare; almost always specified).
+    // Streaming digest-sign + one-shot convenience
     digest-sign-init: func(
       mdname: option<string>,
       key: borrow<keydata>,
       params: list<ossl-param>,
     ) -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE (9):
     digest-sign-update: func(data: list<u8>) -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL (10):
     digest-sign-final: func() -> result<list<u8>, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_SIGN (11) -- one-shot. Combines
-    // digest + sign; faster for backends that don't need to stream.
     digest-sign: func(tbs: list<u8>) -> result<list<u8>, pkey-error>;
 
-    // OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_INIT (12):
     digest-verify-init: func(
       mdname: option<string>,
       key: borrow<keydata>,
       params: list<ossl-param>,
     ) -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_UPDATE (13):
     digest-verify-update: func(data: list<u8>) -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_FINAL (14):
     digest-verify-final: func(sig: list<u8>) -> result<_, pkey-error>;
-    // OSSL_FUNC_SIGNATURE_DIGEST_VERIFY (15) -- one-shot.
     digest-verify: func(sig: list<u8>, tbs: list<u8>) -> result<_, pkey-error>;
 
-    // ---------------------------------------------------------------
     // Per-context params
-
-    // OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS (18) / SET_CTX_PARAMS (20)
     get-ctx-params: func(keys: list<string>)
       -> result<list<ossl-param>, pkey-error>;
     set-ctx-params: func(params: list<ossl-param>)
       -> result<_, pkey-error>;
 
-    // OSSL_FUNC_SIGNATURE_GET_CTX_MD_PARAMS (22) /
-    // SETTABLE_CTX_MD_PARAMS (25). The "md" variants reach into the
-    // backing message-digest context (e.g., set the salt length on
-    // the SHA256 step of an RSA-PSS sign).
+    // Per-context message-digest params (RSA-PSS salt length, etc.)
     get-ctx-md-params: func(keys: list<string>)
       -> result<list<ossl-param>, pkey-error>;
     set-ctx-md-params: func(params: list<ossl-param>)
       -> result<_, pkey-error>;
-
-    // OSSL_FUNC_SIGNATURE_GETTABLE_CTX_MD_PARAMS (23) /
-    // SETTABLE_CTX_MD_PARAMS (25) -- these are instance methods
-    // because the MD type may change after sign-init (when the
-    // digest is bound to the key) and the gettable set is
-    // MD-specific.
     gettable-ctx-md-params: func() -> list<ossl-param-descriptor>;
     settable-ctx-md-params: func() -> list<ossl-param-descriptor>;
   }
