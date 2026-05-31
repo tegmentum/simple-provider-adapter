@@ -45,6 +45,10 @@ fn parse_digest_param(params: &[pk::OsslParam]) -> backend::DigestAlgorithm {
     backend::DigestAlgorithm::Sha256
 }
 
+fn has_explicit_digest(params: &[pk::OsslParam]) -> bool {
+    params.iter().any(|p| p.key == "digest")
+}
+
 fn digest_name_to_backend(s: &str) -> backend::DigestAlgorithm {
     let up = s.to_ascii_uppercase();
     let norm = up.replace('-', "").replace("SHA2", "SHA");
@@ -59,6 +63,52 @@ fn digest_name_to_backend(s: &str) -> backend::DigestAlgorithm {
         "SHA3S512" => backend::DigestAlgorithm::Sha3S512,
         _          => backend::DigestAlgorithm::Sha256,
     }
+}
+
+/// Strip a SubjectPublicKeyInfo (X.509 DER) down to the BIT STRING
+/// contents -- the raw subject-public-key bytes that OSSL_PKEY_PARAM_
+/// ENCODED_PUBLIC_KEY expects (SEC1 uncompressed point for EC, raw
+/// 32-byte public key for Ed25519, RSAPublicKey DER for RSA).
+fn spki_to_subject_public_key(spki: &[u8]) -> Result<Vec<u8>, km::PkeyError> {
+    // SPKI = SEQUENCE { AlgorithmIdentifier(SEQUENCE), BIT STRING }.
+    // Skip outer SEQUENCE header, skip AlgorithmIdentifier SEQUENCE,
+    // then we're at the BIT STRING. Skip 0x03 tag + length + the
+    // unused-bits 0x00 byte; return the rest.
+    let (_outer, body) = strip_tag_length(spki, 0x30)
+        .ok_or_else(|| km::PkeyError::Internal("SPKI: not a SEQUENCE".into()))?;
+    // Inside body: AlgorithmIdentifier (SEQUENCE), then BIT STRING.
+    let (alg_len, after_alg_hdr) = read_tag_length(body, 0x30)
+        .ok_or_else(|| km::PkeyError::Internal("SPKI: missing AlgorithmIdentifier".into()))?;
+    let after_alg = &after_alg_hdr[alg_len..];
+    let (_bs_len, bit_string_body) = read_tag_length(after_alg, 0x03)
+        .ok_or_else(|| km::PkeyError::Internal("SPKI: missing BIT STRING".into()))?;
+    if bit_string_body.is_empty() {
+        return Err(km::PkeyError::Internal("SPKI: empty BIT STRING".into()));
+    }
+    // First byte is unused-bits count; should be 0 for crypto pubkeys.
+    Ok(bit_string_body[1..].to_vec())
+}
+
+/// Strip a DER tag+length+value, returning (full slice, body slice).
+fn strip_tag_length(buf: &[u8], expected_tag: u8) -> Option<(&[u8], &[u8])> {
+    let (len, body) = read_tag_length(buf, expected_tag)?;
+    Some((&buf[..body.as_ptr() as usize - buf.as_ptr() as usize + len], &body[..len]))
+}
+
+/// Read DER tag + length header. Returns (body_len, body_slice).
+fn read_tag_length(buf: &[u8], expected_tag: u8) -> Option<(usize, &[u8])> {
+    if buf.len() < 2 || buf[0] != expected_tag { return None; }
+    let (len, hdr) = if buf[1] & 0x80 == 0 {
+        (buf[1] as usize, 2)
+    } else {
+        let nb = (buf[1] & 0x7f) as usize;
+        if nb == 0 || buf.len() < 2 + nb { return None; }
+        let mut v = 0usize;
+        for i in 0..nb { v = (v << 8) | buf[2 + i] as usize; }
+        (v, 2 + nb)
+    };
+    if buf.len() < hdr + len { return None; }
+    Some((len, &buf[hdr..]))
 }
 
 fn backend_to_pkey(e: backend::BackendError) -> pk::PkeyError {
@@ -306,9 +356,29 @@ impl km::GuestKeydata for Keydata {
         let key = key.as_ref().ok_or_else(||
             km::PkeyError::InvalidState("keydata has no backend key".into()))?;
         let spki = key.public_key_info().map_err(backend_to_pkey)?;
+
+        // OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY expects:
+        //   - EC: the SEC1 uncompressed point (e.g. 65 bytes for P-256:
+        //         0x04 || X || Y), NOT a SubjectPublicKeyInfo wrapper.
+        //   - Ed25519/X25519: the raw 32-byte public key.
+        //
+        // The bridge's public_key_info() returns SPKI (most useful for
+        // cert / chain construction); strip down to the BIT STRING
+        // contents for the OSSL_PARAM. Adapter doesn't know the key
+        // algorithm here directly; introspect algorithm cache.
+        let algo = self.algorithm.borrow().clone();
+        let encoded = match algo {
+            Some(backend::KeyAlgorithm::Ec(_)) => spki_to_subject_public_key(&spki)?,
+            // RSA OSSL_PARAM encoded-public-key is the raw RSAPublicKey
+            // DER (the BIT STRING contents, same idea). Strip SPKI down.
+            Some(backend::KeyAlgorithm::Rsa(_)) => spki_to_subject_public_key(&spki)?,
+            // Ed25519/Ed448: raw public key, same shape as the SPKI
+            // BIT STRING contents.
+            _ => spki_to_subject_public_key(&spki)?,
+        };
         Ok(vec![vec![km::OsslParam {
             key: "encoded-public-key".into(),
-            value: pk::OsslParamValue::OctetString(spki),
+            value: pk::OsslParamValue::OctetString(encoded),
         }]])
     }
     fn dup(&self, _selection: km::KeySelection)
@@ -384,9 +454,20 @@ impl sig::GuestSignatureContext for SignatureContext {
             return Err(sig::PkeyError::InvalidState(
                 "wit-bridge sign_init: keydata is empty".into()));
         }
-        let digest = parse_digest_param(&params);
+        // sign_init (vs digest_sign_init) is called when the caller
+        // (EVP_PKEY_sign) is doing the hashing itself and handing
+        // the bridge a digest. Default to Ecdsa(Raw) so the backend
+        // picks the raw mech (CKM_ECDSA, not CKM_ECDSA_SHA256 -- the
+        // latter would double-hash). If params explicitly set a
+        // digest other than "raw" the caller is asking us to hash --
+        // honor that (e.g. legacy ENGINE-style callers).
+        let mech = if has_explicit_digest(&params) {
+            backend::SignatureMechanism::Ecdsa(parse_digest_param(&params))
+        } else {
+            backend::SignatureMechanism::Ecdsa(backend::DigestAlgorithm::Raw)
+        };
         self.uri.replace(Some(uri));
-        self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
+        self.mech.replace(Some(mech));
         Ok(())
     }
     fn sign(&self, tbs: Vec<u8>) -> Result<Vec<u8>, sig::PkeyError> {
