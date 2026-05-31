@@ -775,4 +775,75 @@ impl ac::GuestAsymCipherContext for AsymCipherContext {
 #[allow(dead_code)]
 type _PkeyOsslParam = pk::OsslParam;
 
+// ---------------------------------------------------------------------------
+// Phase 8: ENCODER + DECODER stub exports.
+//
+// provider.query-operation(encoder/decoder) returns no algorithms, so
+// these resource methods are unreachable in practice. The stubs exist
+// so wac plug can satisfy openssl-wasm's imports.
+//
+// Phase 8 follow-up (a Session 3 extension we punt for now): wire
+// encode/decode through to tegmentum:key-backend when the backend
+// supports public-key extraction.
+// ---------------------------------------------------------------------------
+
+use crate::exports::openssl::encoder::encoder as ex_encoder;
+use crate::exports::openssl::decoder::decoder as ex_decoder;
+use crate::exports::openssl::encoder::encoder::EncodeCtx as EncodeCtxRes;
+use crate::exports::openssl::decoder::decoder::DecodeCtx as DecodeCtxRes;
+
+pub struct StubEncodeCtx;
+pub struct StubDecodeCtx;
+
+impl ex_encoder::Guest for Component {
+    type EncodeCtx = StubEncodeCtx;
+    fn gettable_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
+    fn settable_ctx_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
+    fn does_selection(_s: pk::KeySelection) -> bool { false }
+}
+
+impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
+    fn new() -> Self { StubEncodeCtx }
+    fn get_params(&self) -> Result<Vec<pk::OsslParam>, pk::PkeyError> { Ok(Vec::new()) }
+    fn set_ctx_params(&self, _p: Vec<pk::OsslParam>) -> Result<(), pk::PkeyError> { Ok(()) }
+    fn import_object(&self, _s: pk::KeySelection, _p: Vec<pk::OsslParam>)
+        -> Result<km::Keydata, pk::PkeyError>
+    {
+        Err(pk::PkeyError::NotSupported("encoder.import-object".into()))
+    }
+    fn encode(&self, _obj: ex_encoder::KeydataBorrow<'_>, _s: pk::KeySelection)
+        -> Result<Vec<u8>, pk::PkeyError>
+    {
+        Err(pk::PkeyError::NotSupported("encoder.encode".into()))
+    }
+}
+
+impl ex_decoder::Guest for Component {
+    type DecodeCtx = StubDecodeCtx;
+    fn gettable_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
+    fn settable_ctx_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
+    fn does_selection(_s: pk::KeySelection) -> bool { false }
+}
+
+impl ex_decoder::GuestDecodeCtx for StubDecodeCtx {
+    fn new() -> Self { StubDecodeCtx }
+    fn get_params(&self) -> Result<Vec<pk::OsslParam>, pk::PkeyError> { Ok(Vec::new()) }
+    fn set_ctx_params(&self, _p: Vec<pk::OsslParam>) -> Result<(), pk::PkeyError> { Ok(()) }
+    fn decode(&self, _i: Vec<u8>, _s: pk::KeySelection)
+        -> Result<Vec<ex_decoder::DecodedObject>, pk::PkeyError>
+    {
+        Ok(Vec::new())  // empty result means "not recognised by this decoder"
+    }
+    fn export_object(&self, _obj: ex_decoder::KeydataBorrow<'_>)
+        -> Result<Vec<pk::OsslParam>, pk::PkeyError>
+    {
+        Err(pk::PkeyError::NotSupported("decoder.export-object".into()))
+    }
+}
+
+#[allow(dead_code)]
+type _EncCtx = EncodeCtxRes;
+#[allow(dead_code)]
+type _DecCtx = DecodeCtxRes;
+
 export!(Component);

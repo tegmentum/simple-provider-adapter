@@ -1,0 +1,119 @@
+// OpenSSL 3 OSSL_OP_DECODER mirror. The inverse of openssl:encoder
+// — takes PEM / DER / JWK bytes and produces provider-native keydata
+// + cert + CRL objects. Pairs with openssl:store/store for URI-based
+// loading (STORE backs the URI parsing; DECODER turns the bytes
+// behind a URI into typed objects).
+//
+// Function IDs map to the OSSL_FUNC_DECODER_* enum from
+// <openssl/core_dispatch.h>:
+//
+//   NEWCTX             1   ->  decode-ctx resource constructor
+//   FREECTX            2   ->  decode-ctx resource drop (implicit)
+//   GET_PARAMS         3   ->  decode-ctx.get-params
+//   GETTABLE_PARAMS    4   ->  gettable-params (top-level)
+//   SET_CTX_PARAMS     5   ->  decode-ctx.set-ctx-params
+//   SETTABLE_CTX_PARAMS 6  ->  settable-ctx-params (top-level)
+//   DOES_SELECTION     10  ->  does-selection (top-level)
+//   DECODE             11  ->  decode-ctx.decode
+//   EXPORT_OBJECT      20  ->  decode-ctx.export-object
+//
+// Model shifts from the C ABI:
+//
+// 1. C `OSSL_CORE_BIO *in` becomes `bytes` (list<u8>) input. Most
+//    decode consumers (PEM_read_bio_*, OSSL_DECODER_from_bio with
+//    a memory BIO) already buffer the full input; streaming is rare.
+//
+// 2. C `OSSL_FUNC_DECODER_DECODE` calls OSSL_CALLBACK once per
+//    decoded object. WIT-side: returns `list<decoded-object>` so
+//    we avoid the callback-bridge entirely. The Layer-2 adapter
+//    invokes the C callback once per item on the way out.
+//
+// 3. The passphrase callback is folded into set-ctx-params via a
+//    "passphrase" octet-string param (same pattern as encoder).
+//
+// 4. EXPORT_OBJECT (20) lets a decoder marshal an OSSL_PARAM[]-style
+//    abstract representation of an object for a sibling provider to
+//    re-import. Modeled as `export-object` returning the abstract
+//    OSSL_PARAM list directly.
+
+package openssl:decoder@0.1.0;
+
+interface decoder {
+  use openssl:pkey/pkey@0.1.0.{
+    key-selection, ossl-param, ossl-param-descriptor, pkey-error,
+  };
+  use openssl:keymgmt/keymgmt@0.1.0.{keydata};
+
+  // What kind of object the decoder produced. Mirrors the
+  // OSSL_OBJECT_PARAM_TYPE int that flows through the OSSL_CALLBACK
+  // (1=NAME, 2=PKEY, 3=CERT, 4=CRL). We use a typed variant + carry
+  // the actual payload, so consumers don't need a second decode pass.
+  variant decoded-object {
+    /// X.509 cert DER
+    cert(list<u8>),
+    /// CRL DER
+    crl(list<u8>),
+    /// Provider-native keydata (the decoder turns bytes into a key)
+    key(keydata),
+    /// URI-only result (just a name; caller re-issues against another
+    /// loader). Same role as store-object::name.
+    name(string),
+  }
+
+  // OSSL_FUNC_DECODER_GETTABLE_PARAMS (4) — common keys:
+  //   "input-type"  (utf8): "PEM" | "DER" | "JWK" | "MSBLOB" | "PVK"
+  //   "structure"   (utf8): "PrivateKeyInfo" | "SubjectPublicKeyInfo" | ...
+  //   "input-structure" (utf8): variant for layered decode chains
+  gettable-params: func() -> list<ossl-param-descriptor>;
+
+  // OSSL_FUNC_DECODER_SETTABLE_CTX_PARAMS (6) — common keys:
+  //   "passphrase" (octet-string): for encrypted PEM blobs
+  //   "properties" (utf8): cipher property filter for libcrypto decrypt
+  settable-ctx-params: func() -> list<ossl-param-descriptor>;
+
+  // OSSL_FUNC_DECODER_DOES_SELECTION (10):
+  // Probe whether THIS decoder produces output matching the requested
+  // selection (private / public / domain-params bits). Cheap probe
+  // before calling decode; the Layer-2 adapter caches results.
+  does-selection: func(selection: key-selection) -> bool;
+
+  // OSSL_FUNC_DECODER_NEWCTX (1) returns a decode-ctx.
+  //
+  // Per-operation state: settable params (passphrase, properties),
+  // current selection. Reusable across multiple decode calls if
+  // the caller has multiple inputs to process with the same config.
+  resource decode-ctx {
+    constructor();
+
+    // OSSL_FUNC_DECODER_GET_PARAMS (3): retrieve ctx-internal
+    // settings (input-type, structure, ...) for caller inspection.
+    get-params: func() -> result<list<ossl-param>, pkey-error>;
+
+    // OSSL_FUNC_DECODER_SET_CTX_PARAMS (5): apply caller overrides
+    // (passphrase, properties).
+    set-ctx-params: func(params: list<ossl-param>) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_DECODER_DECODE (11):
+    // The main op. `input` is the full byte blob to decode. The
+    // `selection` narrows what kinds of objects to materialise
+    // (PRIVATE / PUBLIC / DOMAIN_PARAMS).
+    //
+    // Returns a list of decoded objects in the order the decoder
+    // surfaced them. Empty list means "input wasn't recognised by
+    // this decoder" (consumers iterate decoders looking for a hit);
+    // a non-empty list means decode succeeded with that many objects.
+    decode: func(input: list<u8>, selection: key-selection)
+        -> result<list<decoded-object>, pkey-error>;
+
+    // OSSL_FUNC_DECODER_EXPORT_OBJECT (20):
+    // Marshal a previously-decoded object as an OSSL_PARAM[] abstract
+    // representation. Used to hand decoded keys off to a sibling
+    // provider for re-import (e.g., decoder decodes PEM → exports
+    // params → wit-bridge keymgmt imports into its native rep).
+    //
+    // `obj-ref` is borrowed; the decoder is responsible for picking
+    // the right OSSL_PARAM layout based on the object's type.
+    export-object: func(obj: borrow<keydata>)
+        -> result<list<ossl-param>, pkey-error>;
+  }
+}

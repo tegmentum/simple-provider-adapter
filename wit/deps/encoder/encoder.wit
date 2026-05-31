@@ -1,0 +1,108 @@
+// OpenSSL 3 OSSL_OP_ENCODER mirror. Lets a provider serialise its
+// own keydata into PEM / DER / JWK / etc. so consumers
+// (`PEM_write_bio_PUBKEY`, `OSSL_ENCODER_to_bio`, etc.) can extract
+// public keys from HSM-resident keydata without ever materialising
+// the private half. Pairs with openssl:decoder for round-trips.
+//
+// Function IDs map to the OSSL_FUNC_ENCODER_* enum from
+// <openssl/core_dispatch.h>:
+//
+//   NEWCTX             1   ->  encode-ctx resource constructor
+//   FREECTX            2   ->  encode-ctx resource drop (implicit)
+//   GET_PARAMS         3   ->  encode-ctx.get-params
+//   GETTABLE_PARAMS    4   ->  gettable-params (top-level)
+//   SET_CTX_PARAMS     5   ->  encode-ctx.set-ctx-params
+//   SETTABLE_CTX_PARAMS 6  ->  settable-ctx-params (top-level)
+//   DOES_SELECTION     10  ->  does-selection (top-level)
+//   ENCODE             11  ->  encode-ctx.encode
+//   IMPORT_OBJECT      20  ->  encode-ctx.import-object
+//   FREE_OBJECT        21  ->  (implicit; the WIT keydata destructor handles it)
+//
+// Model shifts from the C ABI:
+//
+// 1. C `OSSL_CORE_BIO *out` becomes a return-by-value `list<u8>`.
+//    Most encoder consumers (PEM_write_*, OSSL_ENCODER_to_data) want
+//    the full encoded blob; streaming via BIO is rare in practice.
+//    The Layer-2 adapter can wrap the bytes back into a memory BIO
+//    for OpenSSL's view.
+//
+// 2. C `int 0/1` returns become `result<_, pkey-error>` /
+//    `result<list<u8>, pkey-error>`.
+//
+// 3. `OSSL_FUNC_ENCODER_FREE_OBJECT` (21) collapses into the
+//    keymgmt.keydata resource-drop the import-object path returns.
+//
+// Property discovery: provider.query-operation(operation::encoder)
+// returns one ossl-algorithm per (input-type, output-type, structure)
+// triple. The algorithm-names string uses the standard form
+// "EC:RSA:..." and property-definition encodes
+// "output=PEM, structure=PrivateKeyInfo, fips=no" (parsed by libssl).
+
+package openssl:encoder@0.1.0;
+
+interface encoder {
+  use openssl:pkey/pkey@0.1.0.{
+    key-selection, ossl-param, ossl-param-descriptor, pkey-error,
+  };
+  use openssl:keymgmt/keymgmt@0.1.0.{keydata};
+
+  // OSSL_FUNC_ENCODER_GETTABLE_PARAMS (4):
+  // Which params the encoder advertises via get-params. Common keys:
+  //   "output-type" (utf8): "PEM" | "DER" | "JWK" | "MSBLOB" | "PVK"
+  //   "input-type"  (utf8): typically the keymgmt alg name ("RSA", "EC")
+  //   "structure"   (utf8): "PrivateKeyInfo" | "SubjectPublicKeyInfo" | ...
+  gettable-params: func() -> list<ossl-param-descriptor>;
+
+  // OSSL_FUNC_ENCODER_SETTABLE_CTX_PARAMS (6):
+  // Per-encoder-instance params. Common keys:
+  //   "cipher"     (utf8): for PEM encryption, e.g. "AES-256-CBC"
+  //   "properties" (utf8): cipher property filter
+  //   "save-parameters" (int): include domain params (DH/EC) inline
+  settable-ctx-params: func() -> list<ossl-param-descriptor>;
+
+  // OSSL_FUNC_ENCODER_DOES_SELECTION (10):
+  // Probe whether THIS encoder produces output for the given
+  // selection bits (e.g. private + public + params). Cheap probe
+  // before calling encode. The Layer-2 adapter caches results.
+  does-selection: func(selection: key-selection) -> bool;
+
+  // OSSL_FUNC_ENCODER_NEWCTX (1) returns an encode-ctx.
+  //
+  // The ctx is per-operation state: settable params (cipher, ...),
+  // current selection, etc. One ctx may produce multiple encoded
+  // blobs (call encode repeatedly with different keydata).
+  resource encode-ctx {
+    constructor();
+
+    // OSSL_FUNC_ENCODER_GET_PARAMS (3): retrieve ctx-internal
+    // settings (output-type, etc.) that the caller wants to inspect.
+    get-params: func() -> result<list<ossl-param>, pkey-error>;
+
+    // OSSL_FUNC_ENCODER_SET_CTX_PARAMS (5): apply caller-side
+    // overrides (encryption cipher, properties, etc.).
+    set-ctx-params: func(params: list<ossl-param>) -> result<_, pkey-error>;
+
+    // OSSL_FUNC_ENCODER_IMPORT_OBJECT (20):
+    // Turn an abstract object representation (OSSL_PARAM[] describing
+    // a key) into this provider's keydata. Used when the input
+    // wasn't natively produced by this provider's keymgmt — e.g.
+    // a wit-bridge consumer encoding a software-generated key.
+    // Returns the imported keydata; the caller owns it (via the
+    // keydata resource handle, which auto-drops to call FREE_OBJECT).
+    import-object: func(selection: key-selection, params: list<ossl-param>)
+        -> result<keydata, pkey-error>;
+
+    // OSSL_FUNC_ENCODER_ENCODE (11):
+    // The main op. `obj` is borrowed; the encoder reads its public
+    // half (or private if the selection asks + the keymgmt permits).
+    // `selection` narrows what to encode (PRIVATE / PUBLIC / DOMAIN_PARAMS).
+    // Returns the encoded blob — usually PEM (utf8 in bytes) or DER (binary).
+    //
+    // The passphrase callback from the C ABI is folded into
+    // set-ctx-params via "cipher=..." + a "passphrase" octet-string
+    // param the caller supplies. WIT doesn't model the callback
+    // round-trip; the Layer-2 adapter handles it.
+    encode: func(obj: borrow<keydata>, selection: key-selection)
+        -> result<list<u8>, pkey-error>;
+  }
+}
