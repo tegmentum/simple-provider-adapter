@@ -45,6 +45,7 @@ fn parse_digest_param(params: &[pk::OsslParam]) -> backend::DigestAlgorithm {
     backend::DigestAlgorithm::Sha256
 }
 
+#[allow(dead_code)]
 fn has_explicit_digest(params: &[pk::OsslParam]) -> bool {
     params.iter().any(|p| p.key == "digest")
 }
@@ -135,18 +136,38 @@ impl prov::Guest for Component {
     }
     fn query_operation(op: prov::Operation) -> (Vec<prov::OsslAlgorithm>, bool) {
         match op {
-            prov::Operation::Keymgmt => (
-                vec![prov::OsslAlgorithm {
+            // Two keymgmts: openssl fetches by name, picks the
+            // matching dispatch. The wit-bridge keydata + the
+            // underlying URI resolution is shared -- the adapter
+            // routes per-key by inspecting the cached algorithm.
+            prov::Operation::Keymgmt => (vec![
+                prov::OsslAlgorithm {
                     algorithm_names: "EC".into(),
                     property_definition: "provider=wit-bridge".into(),
                     description: Some("EC keymgmt via wit-bridge".into()),
-                }], false),
-            prov::Operation::Signature => (
-                vec![prov::OsslAlgorithm {
+                },
+                prov::OsslAlgorithm {
+                    algorithm_names: "RSA".into(),
+                    property_definition: "provider=wit-bridge".into(),
+                    description: Some("RSA keymgmt via wit-bridge".into()),
+                },
+            ], false),
+            // Two signatures: "ECDSA" for EC keys, "RSA-PSS" for
+            // RSA keys. Each gets its own settable_ctx_params on the
+            // C side (just "digest" for ECDSA; digest + pad-mode +
+            // mgf1-digest + saltlen for RSA-PSS).
+            prov::Operation::Signature => (vec![
+                prov::OsslAlgorithm {
                     algorithm_names: "ECDSA".into(),
                     property_definition: "provider=wit-bridge".into(),
                     description: Some("ECDSA via wit-bridge".into()),
-                }], false),
+                },
+                prov::OsslAlgorithm {
+                    algorithm_names: "RSA-PSS".into(),
+                    property_definition: "provider=wit-bridge".into(),
+                    description: Some("RSA-PSS via wit-bridge".into()),
+                },
+            ], false),
             _ => (Vec::new(), true),
         }
     }
@@ -245,12 +266,43 @@ impl km::GuestKeydata for Keydata {
                     key: "group".into(),
                     value: pk::OsslParamValue::Utf8String(info.curve.clone()),
                 });
+                // EC point conversion format: openssl's TLS sigalg
+                // codepath asks for this and trips on a downstream
+                // OID lookup if missing -> "no shared cipher".
+                out.push(km::OsslParam {
+                    key: "point-format".into(),
+                    value: pk::OsslParamValue::Utf8String("uncompressed".into()),
+                });
+                // EC encoding name (per OpenSSL EC keymgmt impl).
+                out.push(km::OsslParam {
+                    key: "encoding".into(),
+                    value: pk::OsslParamValue::Utf8String("named_curve".into()),
+                });
+                // OSSL_PKEY_PARAM_EC_GROUP_CHECK: tell openssl we've
+                // already validated the curve. Some TLS sigalg paths
+                // skip the curve-name OBJ lookup if this is present.
+                // Also publish the integer NID directly so the sigalg
+                // check can match by NID rather than string -> avoids
+                // OBJ_txt2obj("secp384r1") miss on builds where the
+                // NIST alias table only knows the OID number.
+                let nid: i64 = match info.curve.as_str() {
+                    "prime256v1" | "P-256" => 415,  // NID_X9_62_prime256v1
+                    "secp384r1"  | "P-384" => 715,  // NID_secp384r1
+                    "secp521r1"  | "P-521" => 716,  // NID_secp521r1
+                    _ => -1,
+                };
+                if nid > 0 {
+                    out.push(km::OsslParam {
+                        key: "group-nid".into(),
+                        value: pk::OsslParamValue::Integer(nid),
+                    });
+                }
                 // Bit size + max-signature-size depend on curve.
                 let (bits, max_sig) = match info.curve.as_str() {
-                    "P-256" => (256u32, 72u64),
-                    "P-384" => (384, 104),
-                    "P-521" => (521, 139),
-                    _       => (256, 72),
+                    "P-256" | "prime256v1" => (256u32, 72u64),
+                    "P-384" | "secp384r1"  => (384, 104),
+                    "P-521" | "secp521r1"  => (521, 139),
+                    _                      => (256, 72),
                 };
                 out.push(km::OsslParam {
                     key: "bits".into(),
@@ -367,19 +419,42 @@ impl km::GuestKeydata for Keydata {
         // contents for the OSSL_PARAM. Adapter doesn't know the key
         // algorithm here directly; introspect algorithm cache.
         let algo = self.algorithm.borrow().clone();
-        let encoded = match algo {
-            Some(backend::KeyAlgorithm::Ec(_)) => spki_to_subject_public_key(&spki)?,
-            // RSA OSSL_PARAM encoded-public-key is the raw RSAPublicKey
-            // DER (the BIT STRING contents, same idea). Strip SPKI down.
-            Some(backend::KeyAlgorithm::Rsa(_)) => spki_to_subject_public_key(&spki)?,
-            // Ed25519/Ed448: raw public key, same shape as the SPKI
-            // BIT STRING contents.
-            _ => spki_to_subject_public_key(&spki)?,
-        };
-        Ok(vec![vec![km::OsslParam {
-            key: "encoded-public-key".into(),
-            value: pk::OsslParamValue::OctetString(encoded),
-        }]])
+        let encoded = spki_to_subject_public_key(&spki)?;
+        let mut out = vec![
+            // OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY: raw subject-public-key
+            // bytes (SEC1 uncompressed point for EC, raw 32 bytes for
+            // Ed25519, RSAPublicKey DER for RSA).
+            km::OsslParam {
+                key: "encoded-pub-key".into(),
+                value: pk::OsslParamValue::OctetString(encoded.clone()),
+            },
+            // Some openssl call sites use "pub" (without the
+            // "encoded-" prefix). Both names point at the same bytes.
+            km::OsslParam {
+                key: "pub".into(),
+                value: pk::OsslParamValue::OctetString(encoded),
+            },
+        ];
+        // EC keys additionally need the curve name -- without it
+        // OpenSSL's EC keymgmt rejects fromdata / set_pubkey. The
+        // i2d_PUBKEY encoder for SubjectPublicKeyInfo also needs
+        // point-format + encoding alongside the bytes, or it trips
+        // EC_R_INVALID_ENCODING decoding the SEC1 point.
+        if let Some(backend::KeyAlgorithm::Ec(info)) = algo {
+            out.push(km::OsslParam {
+                key: "group".into(),
+                value: pk::OsslParamValue::Utf8String(info.curve),
+            });
+            out.push(km::OsslParam {
+                key: "point-format".into(),
+                value: pk::OsslParamValue::Utf8String("uncompressed".into()),
+            });
+            out.push(km::OsslParam {
+                key: "encoding".into(),
+                value: pk::OsslParamValue::Utf8String("named_curve".into()),
+            });
+        }
+        Ok(vec![out])
     }
     fn dup(&self, _selection: km::KeySelection)
         -> Result<km::Keydata, km::PkeyError> {
@@ -419,8 +494,69 @@ impl sig::Guest for Component {
     type SignatureContext = SignatureContext;
 
     fn query_key_types() -> Vec<String> { vec!["EC".into()] }
-    fn gettable_ctx_params() -> Vec<sig::OsslParamDescriptor> { Vec::new() }
-    fn settable_ctx_params() -> Vec<sig::OsslParamDescriptor> { Vec::new() }
+    fn gettable_ctx_params() -> Vec<sig::OsslParamDescriptor> {
+        // What can be read back via signature.get_ctx_params. The
+        // legacy EVP_PKEY_CTX_ctrl translation layer (ctrl_params_
+        // translate.c) refuses unknown params on the get side; same
+        // shape as settable below.
+        vec![
+            sig::OsslParamDescriptor {
+                key: "digest".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "pad-mode".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "algorithm-id".into(),
+                kind: pk::OsslParamKind::OctetString,
+            },
+        ]
+    }
+    fn settable_ctx_params() -> Vec<sig::OsslParamDescriptor> {
+        // ctrl_params_translate.c (legacy EVP_PKEY_CTX_set_signature_md
+        // / set_rsa_padding / etc. -> OSSL_PARAM translation) raises
+        // ERR_R_UNSUPPORTED when the destination's settable_ctx_params
+        // doesn't advertise the key it's translating to. TLS's
+        // CertVerify path goes through this, calling
+        // EVP_PKEY_CTX_set_signature_md(md) which translates to
+        // OSSL_PARAM "digest" -> our set_ctx_params.
+        //
+        // Phase 8a: enumerate the params TLS/X509 set during
+        // sign-init. "digest" covers ECDSA + RSA; "pad-mode" +
+        // "saltlen" cover RSA-PSS; "mgf1-digest" + "mgf1-properties"
+        // for RSA-PSS / RSA-OAEP. List is over-broad on purpose --
+        // our set_ctx_params accepts anything silently, so listing
+        // extra keys doesn't hurt; it just keeps ctrl_params_
+        // translate satisfied for any future caller.
+        vec![
+            sig::OsslParamDescriptor {
+                key: "digest".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "properties".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "pad-mode".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "mgf1-digest".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "mgf1-properties".into(),
+                kind: pk::OsslParamKind::Utf8String,
+            },
+            sig::OsslParamDescriptor {
+                key: "saltlen".into(),
+                kind: pk::OsslParamKind::Integer,
+            },
+        ]
+    }
 }
 
 /// Per-signature-op state.
@@ -454,17 +590,38 @@ impl sig::GuestSignatureContext for SignatureContext {
             return Err(sig::PkeyError::InvalidState(
                 "wit-bridge sign_init: keydata is empty".into()));
         }
-        // sign_init (vs digest_sign_init) is called when the caller
-        // (EVP_PKEY_sign) is doing the hashing itself and handing
-        // the bridge a digest. Default to Ecdsa(Raw) so the backend
-        // picks the raw mech (CKM_ECDSA, not CKM_ECDSA_SHA256 -- the
-        // latter would double-hash). If params explicitly set a
-        // digest other than "raw" the caller is asking us to hash --
-        // honor that (e.g. legacy ENGINE-style callers).
-        let mech = if has_explicit_digest(&params) {
-            backend::SignatureMechanism::Ecdsa(parse_digest_param(&params))
-        } else {
-            backend::SignatureMechanism::Ecdsa(backend::DigestAlgorithm::Raw)
+        // Pick mech based on the bound key's algorithm:
+        //   EC keys  -> Ecdsa(Raw) (CKM_ECDSA, pre-hashed input)
+        //   RSA keys -> RsaPss with default SHA-256 (overridable via
+        //              the digest / mgf1-digest / saltlen OSSL_PARAMs;
+        //              we ignore mgf1-digest != digest for now -- HSM
+        //              tokens almost always require them equal).
+        let algo = keydata.algorithm.borrow().clone();
+        let mech = match algo {
+            Some(backend::KeyAlgorithm::Rsa(_)) => {
+                // RSA-PSS params: digest (OSSL_PARAM utf8 "digest"),
+                // saltlen (int "saltlen"), mgf1-digest is ignored.
+                let mut digest = backend::DigestAlgorithm::Sha256;
+                let mut salt_len: u32 = 0; // 0 = use digest length
+                for p in &params {
+                    if p.key == "digest" {
+                        if let pk::OsslParamValue::Utf8String(s) = &p.value {
+                            digest = digest_name_to_backend(s);
+                        }
+                    } else if p.key == "saltlen" {
+                        if let pk::OsslParamValue::Integer(n) = &p.value {
+                            if *n >= 0 { salt_len = *n as u32; }
+                        }
+                    }
+                }
+                backend::SignatureMechanism::RsaPss(backend::RsaPssParams {
+                    digest,
+                    mgf1_digest: digest,
+                    salt_len,
+                })
+            }
+            // Default / EC path: pre-hashed input via CKM_ECDSA.
+            _ => backend::SignatureMechanism::Ecdsa(backend::DigestAlgorithm::Raw),
         };
         self.uri.replace(Some(uri));
         self.mech.replace(Some(mech));
@@ -497,7 +654,7 @@ impl sig::GuestSignatureContext for SignatureContext {
     }
     fn digest_sign_init(
         &self, md: Option<String>, key: sig::KeydataBorrow<'_>,
-        _params: Vec<sig::OsslParam>,
+        params: Vec<sig::OsslParam>,
     ) -> Result<(), sig::PkeyError> {
         let keydata = key.get::<Keydata>();
         let uri = keydata.uri.borrow().clone();
@@ -507,8 +664,31 @@ impl sig::GuestSignatureContext for SignatureContext {
         }
         let digest = md.as_deref().map(digest_name_to_backend)
             .unwrap_or(backend::DigestAlgorithm::Sha256);
+        // Pick mech based on the bound key's algorithm. RSA keys
+        // get RsaPss with the requested digest (and optional saltlen
+        // from OSSL_PARAMs); EC keys keep the existing Ecdsa(digest)
+        // path which routes to CKM_ECDSA_SHAxxx.
+        let algo = keydata.algorithm.borrow().clone();
+        let mech = match algo {
+            Some(backend::KeyAlgorithm::Rsa(_)) => {
+                let mut salt_len: u32 = 0;
+                for p in &params {
+                    if p.key == "saltlen" {
+                        if let pk::OsslParamValue::Integer(n) = &p.value {
+                            if *n >= 0 { salt_len = *n as u32; }
+                        }
+                    }
+                }
+                backend::SignatureMechanism::RsaPss(backend::RsaPssParams {
+                    digest,
+                    mgf1_digest: digest,
+                    salt_len,
+                })
+            }
+            _ => backend::SignatureMechanism::Ecdsa(digest),
+        };
         self.uri.replace(Some(uri));
-        self.mech.replace(Some(backend::SignatureMechanism::Ecdsa(digest)));
+        self.mech.replace(Some(mech));
         self.update_buf.borrow_mut().clear();
         Ok(())
     }
