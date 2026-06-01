@@ -168,6 +168,25 @@ impl prov::Guest for Component {
                     description: Some("RSA-PSS via wit-bridge".into()),
                 },
             ], false),
+            // SubjectPublicKeyInfo encoders for both algorithms. The
+            // single encode() impl just calls key.public-key-info()
+            // (the backend already returns SPKI DER), so we don't
+            // need per-structure dispatch on the WIT side -- the
+            // property string is what OpenSSL matches against.
+            prov::Operation::Encoder => (vec![
+                prov::OsslAlgorithm {
+                    algorithm_names: "EC".into(),
+                    property_definition:
+                        "provider=wit-bridge,input=EC,output=DER,structure=SubjectPublicKeyInfo".into(),
+                    description: Some("EC SPKI DER encoder via wit-bridge".into()),
+                },
+                prov::OsslAlgorithm {
+                    algorithm_names: "RSA".into(),
+                    property_definition:
+                        "provider=wit-bridge,input=RSA,output=DER,structure=SubjectPublicKeyInfo".into(),
+                    description: Some("RSA SPKI DER encoder via wit-bridge".into()),
+                },
+            ], false),
             _ => (Vec::new(), true),
         }
     }
@@ -799,7 +818,11 @@ impl ex_encoder::Guest for Component {
     type EncodeCtx = StubEncodeCtx;
     fn gettable_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
     fn settable_ctx_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
-    fn does_selection(_s: pk::KeySelection) -> bool { false }
+    /// We only emit SubjectPublicKeyInfo; PUBLIC_KEY is the only
+    /// selection bit we can satisfy.
+    fn does_selection(s: pk::KeySelection) -> bool {
+        s.contains(pk::KeySelection::PUBLIC_KEY)
+    }
 }
 
 impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
@@ -811,10 +834,18 @@ impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
     {
         Err(pk::PkeyError::NotSupported("encoder.import-object".into()))
     }
-    fn encode(&self, _obj: ex_encoder::KeydataBorrow<'_>, _s: pk::KeySelection)
+    fn encode(&self, obj: ex_encoder::KeydataBorrow<'_>, selection: pk::KeySelection)
         -> Result<Vec<u8>, pk::PkeyError>
     {
-        Err(pk::PkeyError::NotSupported("encoder.encode".into()))
+        if !selection.contains(pk::KeySelection::PUBLIC_KEY) {
+            return Err(pk::PkeyError::NotSupported(
+                "encoder.encode: only PUBLIC_KEY (SubjectPublicKeyInfo) supported".into()));
+        }
+        let keydata = obj.get::<Keydata>();
+        let key_ref = keydata.backend_key.borrow();
+        let key = key_ref.as_ref().ok_or_else(||
+            pk::PkeyError::InvalidState("encoder.encode: keydata has no backend key".into()))?;
+        key.public_key_info().map_err(backend_to_pkey)
     }
 }
 
