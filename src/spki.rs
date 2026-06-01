@@ -95,6 +95,107 @@ pub fn build_ec_spki(curve: &str, sec1_point: &[u8]) -> Result<Vec<u8>, &'static
     Ok(der_seq(&spki))
 }
 
+/// Reverse-lookup: DER-encoded curve OID → friendly name string.
+/// Returns None for OIDs we don't recognise.
+pub fn ec_oid_der_to_curve(oid: &[u8]) -> Option<&'static str> {
+    match oid {
+        [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07] => Some("prime256v1"),
+        [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]                   => Some("secp384r1"),
+        [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]                   => Some("secp521r1"),
+        _ => None,
+    }
+}
+
+/// What kind of public key a SubjectPublicKeyInfo carries.
+pub enum SpkiPublicKey {
+    Ec   { curve: &'static str, sec1_point: Vec<u8> },
+    Rsa  { modulus: Vec<u8>,    public_exponent: Vec<u8> },
+}
+
+/// Parse a SubjectPublicKeyInfo DER blob. Recognises EC (with a
+/// named curve we know about) and RSA. Returns a typed enum so the
+/// caller can populate the matching keymgmt's OSSL_PARAM[] format.
+pub fn parse_spki(spki: &[u8]) -> Result<SpkiPublicKey, &'static str> {
+    let (_outer_len, body) = read_tag_length(spki, 0x30)
+        .ok_or("SPKI: outer SEQUENCE missing")?;
+
+    // AlgorithmIdentifier = SEQUENCE { OID, params }
+    let (alg_len, alg_body) = read_tag_length(body, 0x30)
+        .ok_or("SPKI: AlgorithmIdentifier missing")?;
+    let after_alg = &body[alg_body.as_ptr() as usize - body.as_ptr() as usize + alg_len ..];
+
+    // OID is first thing in alg_body
+    let (oid_len, _) = read_tag_length(alg_body, 0x06)
+        .ok_or("SPKI: AlgorithmIdentifier OID missing")?;
+    let oid_total = oid_len + tag_header_len(alg_body);
+    let oid = &alg_body[..oid_total];
+    let alg_params = &alg_body[oid_total..];
+
+    // BIT STRING after AlgorithmIdentifier
+    let (_bs_len, bs_body) = read_tag_length(after_alg, 0x03)
+        .ok_or("SPKI: BIT STRING missing")?;
+    if bs_body.is_empty() { return Err("SPKI: empty BIT STRING"); }
+    if bs_body[0] != 0    { return Err("SPKI: BIT STRING has nonzero unused-bits"); }
+    let bits = &bs_body[1..];
+
+    // OID match
+    const OID_EC:  &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    const OID_RSA: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+
+    if oid == OID_EC {
+        let curve = ec_oid_der_to_curve(alg_params)
+            .ok_or("SPKI: unrecognised EC curve OID")?;
+        return Ok(SpkiPublicKey::Ec { curve, sec1_point: bits.to_vec() });
+    }
+    if oid == OID_RSA {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, exponent INTEGER }
+        let (_rsa_len, rsa_body) = read_tag_length(bits, 0x30)
+            .ok_or("SPKI: RSAPublicKey SEQUENCE missing")?;
+        let (n_len, n_body) = read_tag_length(rsa_body, 0x02)
+            .ok_or("SPKI: RSA modulus INTEGER missing")?;
+        let after_n = &rsa_body[n_body.as_ptr() as usize - rsa_body.as_ptr() as usize + n_len ..];
+        let (e_len, e_body) = read_tag_length(after_n, 0x02)
+            .ok_or("SPKI: RSA exponent INTEGER missing")?;
+        // DER INTEGERs may have a leading 0x00 to keep the value
+        // positive; strip it for the raw modulus / exponent bytes.
+        let n = strip_leading_zero(&n_body[..n_len]);
+        let e = strip_leading_zero(&e_body[..e_len]);
+        return Ok(SpkiPublicKey::Rsa {
+            modulus: n.to_vec(),
+            public_exponent: e.to_vec(),
+        });
+    }
+    Err("SPKI: unsupported algorithm OID")
+}
+
+fn strip_leading_zero(b: &[u8]) -> &[u8] {
+    if b.len() > 1 && b[0] == 0 { &b[1..] } else { b }
+}
+
+fn tag_header_len(buf: &[u8]) -> usize {
+    if buf.len() < 2 { return 0; }
+    if buf[1] & 0x80 == 0 { 2 } else { 2 + (buf[1] & 0x7f) as usize }
+}
+
+/// Returns `(body_len, body_slice)` where body_slice is EXACTLY
+/// body_len bytes (not the rest of buf). The redundant length is
+/// kept for callers that need to walk past the TLV to the next
+/// sibling — they recover the after-slice via &buf[hdr_len+body_len..].
+fn read_tag_length(buf: &[u8], expected_tag: u8) -> Option<(usize, &[u8])> {
+    if buf.len() < 2 || buf[0] != expected_tag { return None; }
+    let (len, hdr) = if buf[1] & 0x80 == 0 {
+        (buf[1] as usize, 2usize)
+    } else {
+        let nb = (buf[1] & 0x7f) as usize;
+        if nb == 0 || buf.len() < 2 + nb { return None; }
+        let mut v = 0usize;
+        for i in 0..nb { v = (v << 8) | buf[2 + i] as usize; }
+        (v, 2 + nb)
+    };
+    if buf.len() < hdr + len { return None; }
+    Some((len, &buf[hdr..hdr + len]))
+}
+
 /// Build an RSA SubjectPublicKeyInfo from raw big-endian modulus +
 /// public exponent. Both inputs are positive bytes (no DER INTEGER
 /// header); der_integer handles canonicalisation.

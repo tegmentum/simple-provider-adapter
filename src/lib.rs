@@ -189,6 +189,25 @@ impl prov::Guest for Component {
                     description: Some("RSA SPKI DER encoder via wit-bridge".into()),
                 },
             ], false),
+            // SubjectPublicKeyInfo decoders. The decode() impl parses
+            // SPKI into a typed enum and stashes both the bytes and
+            // the OSSL_PARAM[]-equivalent components on the resulting
+            // Keydata so export-object can re-emit them for sibling
+            // providers' keymgmt.import.
+            prov::Operation::Decoder => (vec![
+                prov::OsslAlgorithm {
+                    algorithm_names: "EC".into(),
+                    property_definition:
+                        "provider=wit-bridge,input=DER,structure=SubjectPublicKeyInfo".into(),
+                    description: Some("EC SPKI DER decoder via wit-bridge".into()),
+                },
+                prov::OsslAlgorithm {
+                    algorithm_names: "RSA".into(),
+                    property_definition:
+                        "provider=wit-bridge,input=DER,structure=SubjectPublicKeyInfo".into(),
+                    description: Some("RSA SPKI DER decoder via wit-bridge".into()),
+                },
+            ], false),
             _ => (Vec::new(), true),
         }
     }
@@ -245,6 +264,8 @@ impl km::Guest for Component {
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(Some(algorithm)),
             cached_spki: RefCell::new(None),
+            decoded_params: RefCell::new(None),
+            decoded_data_type: RefCell::new(None),
         }))
     }
     fn gen_init(
@@ -270,6 +291,13 @@ struct Keydata {
     /// through backend_key.public-key-info -- the foreign-keymgmt
     /// path doesn't have a backend Key to call.
     cached_spki: RefCell<Option<Vec<u8>>>,
+    /// Set by decoder.decode. decoder.export-object returns these
+    /// verbatim so a sibling provider's keymgmt.import can rebuild
+    /// the key in its own native form.
+    decoded_params: RefCell<Option<Vec<pk::OsslParam>>>,
+    /// Algorithm name ("EC" / "RSA") for the decoded key — surfaced
+    /// to the C bridge so it can emit OSSL_OBJECT_PARAM_DATA_TYPE.
+    decoded_data_type: RefCell<Option<String>>,
 }
 
 impl km::GuestKeydata for Keydata {
@@ -279,6 +307,8 @@ impl km::GuestKeydata for Keydata {
             backend_key: RefCell::new(None),
             algorithm: RefCell::new(None),
             cached_spki: RefCell::new(None),
+            decoded_params: RefCell::new(None),
+            decoded_data_type: RefCell::new(None),
         }
     }
     /// Phase 3: surface the params OpenSSL's EVP layer reads during
@@ -494,6 +524,8 @@ impl km::GuestKeydata for Keydata {
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(algo),
             cached_spki: RefCell::new(self.cached_spki.borrow().clone()),
+            decoded_params: RefCell::new(self.decoded_params.borrow().clone()),
+            decoded_data_type: RefCell::new(self.decoded_data_type.borrow().clone()),
         }))
     }
 }
@@ -857,6 +889,8 @@ impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
             backend_key: RefCell::new(None),
             algorithm: RefCell::new(None),
             cached_spki: RefCell::new(Some(spki)),
+            decoded_params: RefCell::new(None),
+            decoded_data_type: RefCell::new(None),
         }))
     }
     fn encode(&self, obj: ex_encoder::KeydataBorrow<'_>, selection: pk::KeySelection)
@@ -909,22 +943,77 @@ impl ex_decoder::Guest for Component {
     type DecodeCtx = StubDecodeCtx;
     fn gettable_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
     fn settable_ctx_params() -> Vec<pk::OsslParamDescriptor> { Vec::new() }
-    fn does_selection(_s: pk::KeySelection) -> bool { false }
+    /// We only handle SPKI (public key bits). PUBLIC_KEY is the only
+    /// selection bit we can satisfy.
+    fn does_selection(s: pk::KeySelection) -> bool {
+        s.contains(pk::KeySelection::PUBLIC_KEY)
+    }
 }
 
 impl ex_decoder::GuestDecodeCtx for StubDecodeCtx {
     fn new() -> Self { StubDecodeCtx }
     fn get_params(&self) -> Result<Vec<pk::OsslParam>, pk::PkeyError> { Ok(Vec::new()) }
     fn set_ctx_params(&self, _p: Vec<pk::OsslParam>) -> Result<(), pk::PkeyError> { Ok(()) }
-    fn decode(&self, _i: Vec<u8>, _s: pk::KeySelection)
+    /// Parse SubjectPublicKeyInfo DER. On success return a single
+    /// Key result whose Keydata carries both the cached SPKI bytes
+    /// AND the OSSL_PARAM[]-equivalent components, so export-object
+    /// can re-emit them for a sibling keymgmt.import. On unparseable
+    /// or unsupported input return an empty list — the decoder
+    /// framework chains to the next candidate.
+    fn decode(&self, input: Vec<u8>, selection: pk::KeySelection)
         -> Result<Vec<ex_decoder::DecodedObject>, pk::PkeyError>
     {
-        Ok(Vec::new())  // empty result means "not recognised by this decoder"
+        if !selection.contains(pk::KeySelection::PUBLIC_KEY) {
+            return Ok(Vec::new());
+        }
+        let parsed = match spki::parse_spki(&input) {
+            Ok(p)  => p,
+            Err(e) => return Err(pk::PkeyError::InvalidArgument(
+                format!("decoder.decode: SPKI parse failed: {e}"))),
+        };
+        let (params, data_type) = match &parsed {
+            spki::SpkiPublicKey::Ec { curve, sec1_point } => (vec![
+                pk::OsslParam {
+                    key: "group".into(),
+                    value: pk::OsslParamValue::Utf8String((*curve).into()),
+                },
+                pk::OsslParam {
+                    key: "pub".into(),
+                    value: pk::OsslParamValue::OctetString(sec1_point.clone()),
+                },
+            ], "EC".to_string()),
+            spki::SpkiPublicKey::Rsa { modulus, public_exponent } => (vec![
+                pk::OsslParam {
+                    key: "n".into(),
+                    value: pk::OsslParamValue::OctetString(modulus.clone()),
+                },
+                pk::OsslParam {
+                    key: "e".into(),
+                    value: pk::OsslParamValue::OctetString(public_exponent.clone()),
+                },
+            ], "RSA".to_string()),
+        };
+        let kd = km::Keydata::new(Keydata {
+            uri: RefCell::new(String::new()),
+            backend_key: RefCell::new(None),
+            algorithm: RefCell::new(None),
+            cached_spki: RefCell::new(Some(input)),
+            decoded_params: RefCell::new(Some(params)),
+            decoded_data_type: RefCell::new(Some(data_type)),
+        });
+        Ok(vec![ex_decoder::DecodedObject::Key(kd)])
     }
-    fn export_object(&self, _obj: ex_decoder::KeydataBorrow<'_>)
+    /// Hand the decoded OSSL_PARAM[] back so a sibling provider's
+    /// keymgmt.import can rebuild the key. The keydata must be one
+    /// that decode() produced (decoded_params set); otherwise we
+    /// have nothing to export.
+    fn export_object(&self, obj: ex_decoder::KeydataBorrow<'_>)
         -> Result<Vec<pk::OsslParam>, pk::PkeyError>
     {
-        Err(pk::PkeyError::NotSupported("decoder.export-object".into()))
+        let kd = obj.get::<Keydata>();
+        kd.decoded_params.borrow().clone().ok_or_else(||
+            pk::PkeyError::InvalidState(
+                "decoder.export-object: keydata wasn't produced by decoder.decode".into()))
     }
 }
 
