@@ -17,6 +17,8 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+mod spki;
+
 use std::cell::RefCell;
 
 use exports::openssl::{
@@ -242,6 +244,7 @@ impl km::Guest for Component {
             uri: RefCell::new(uri),
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(Some(algorithm)),
+            cached_spki: RefCell::new(None),
         }))
     }
     fn gen_init(
@@ -262,6 +265,11 @@ struct Keydata {
     uri: RefCell<String>,
     backend_key: RefCell<Option<backend::Key>>,
     algorithm: RefCell<Option<backend::KeyAlgorithm>>,
+    /// Pre-assembled SPKI from encoder.import-object. When this is
+    /// set, encoder.encode returns it verbatim instead of routing
+    /// through backend_key.public-key-info -- the foreign-keymgmt
+    /// path doesn't have a backend Key to call.
+    cached_spki: RefCell<Option<Vec<u8>>>,
 }
 
 impl km::GuestKeydata for Keydata {
@@ -270,6 +278,7 @@ impl km::GuestKeydata for Keydata {
             uri: RefCell::new(String::new()),
             backend_key: RefCell::new(None),
             algorithm: RefCell::new(None),
+            cached_spki: RefCell::new(None),
         }
     }
     /// Phase 3: surface the params OpenSSL's EVP layer reads during
@@ -484,6 +493,7 @@ impl km::GuestKeydata for Keydata {
             uri: RefCell::new(uri),
             backend_key: RefCell::new(Some(key)),
             algorithm: RefCell::new(algo),
+            cached_spki: RefCell::new(self.cached_spki.borrow().clone()),
         }))
     }
 }
@@ -829,10 +839,25 @@ impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
     fn new() -> Self { StubEncodeCtx }
     fn get_params(&self) -> Result<Vec<pk::OsslParam>, pk::PkeyError> { Ok(Vec::new()) }
     fn set_ctx_params(&self, _p: Vec<pk::OsslParam>) -> Result<(), pk::PkeyError> { Ok(()) }
-    fn import_object(&self, _s: pk::KeySelection, _p: Vec<pk::OsslParam>)
+    /// Cross-provider encode: OpenSSL calls this when the input
+    /// EVP_PKEY's keymgmt isn't ours. The framework hands us the
+    /// foreign key's exported public-key params; we assemble SPKI
+    /// inline and stash it on a fresh Keydata. The subsequent
+    /// encode() call short-circuits on cached_spki.
+    fn import_object(&self, selection: pk::KeySelection, params: Vec<pk::OsslParam>)
         -> Result<km::Keydata, pk::PkeyError>
     {
-        Err(pk::PkeyError::NotSupported("encoder.import-object".into()))
+        if !selection.contains(pk::KeySelection::PUBLIC_KEY) {
+            return Err(pk::PkeyError::NotSupported(
+                "encoder.import-object: only PUBLIC_KEY supported".into()));
+        }
+        let spki = build_spki_from_params(&params)?;
+        Ok(km::Keydata::new(Keydata {
+            uri: RefCell::new(String::new()),
+            backend_key: RefCell::new(None),
+            algorithm: RefCell::new(None),
+            cached_spki: RefCell::new(Some(spki)),
+        }))
     }
     fn encode(&self, obj: ex_encoder::KeydataBorrow<'_>, selection: pk::KeySelection)
         -> Result<Vec<u8>, pk::PkeyError>
@@ -842,11 +867,42 @@ impl ex_encoder::GuestEncodeCtx for StubEncodeCtx {
                 "encoder.encode: only PUBLIC_KEY (SubjectPublicKeyInfo) supported".into()));
         }
         let keydata = obj.get::<Keydata>();
+        if let Some(spki) = keydata.cached_spki.borrow().as_ref() {
+            return Ok(spki.clone());  // cross-provider path
+        }
         let key_ref = keydata.backend_key.borrow();
         let key = key_ref.as_ref().ok_or_else(||
             pk::PkeyError::InvalidState("encoder.encode: keydata has no backend key".into()))?;
         key.public_key_info().map_err(backend_to_pkey)
     }
+}
+
+/// Assemble SPKI from an exported foreign keymgmt's OSSL_PARAM list.
+/// Recognises EC ("group" utf8 + "pub" octet-string) and RSA ("n"
+/// octet-string + "e" octet-string).
+fn build_spki_from_params(params: &[pk::OsslParam]) -> Result<Vec<u8>, pk::PkeyError> {
+    let mut group:   Option<String>  = None;
+    let mut pub_pt:  Option<Vec<u8>> = None;
+    let mut n_bytes: Option<Vec<u8>> = None;
+    let mut e_bytes: Option<Vec<u8>> = None;
+    for p in params {
+        match (p.key.as_str(), &p.value) {
+            ("group", pk::OsslParamValue::Utf8String(s))      => group  = Some(s.clone()),
+            ("pub",   pk::OsslParamValue::OctetString(b))     => pub_pt = Some(b.clone()),
+            ("n",     pk::OsslParamValue::OctetString(b))     => n_bytes = Some(b.clone()),
+            ("e",     pk::OsslParamValue::OctetString(b))     => e_bytes = Some(b.clone()),
+            _ => {}
+        }
+    }
+    if let (Some(curve), Some(pt)) = (&group, &pub_pt) {
+        return spki::build_ec_spki(curve, pt).map_err(|e|
+            pk::PkeyError::InvalidArgument(format!("encoder.import-object EC: {e}")));
+    }
+    if let (Some(n), Some(e)) = (&n_bytes, &e_bytes) {
+        return Ok(spki::build_rsa_spki(n, e));
+    }
+    Err(pk::PkeyError::InvalidArgument(
+        "encoder.import-object: params lack EC (group+pub) or RSA (n+e)".into()))
 }
 
 impl ex_decoder::Guest for Component {
